@@ -376,6 +376,7 @@ const state = {
   distributions: [],
   duplicates: [],
   systemLogs: [],
+  systemLogsError: null,
   formFieldSettings: { ...DEFAULT_FORM_FIELD_SETTINGS },
   loading: false,
   dbError: null,
@@ -507,6 +508,23 @@ function randomPassword(len) {
 }
 
 /* ---------------- data loading ---------------- */
+async function loadSystemLogsOnly() {
+  if (state.user.role !== 'admin') return;
+  state.systemLogsError = null;
+  try {
+    const logsObj = await dbGet('systemLogs');
+    state.systemLogs = objToArray(logsObj).sort((a, b) => (b.timestamp || 0) - (a.timestamp || 0));
+  } catch (e) {
+    // Most common cause: the Realtime Database Security Rules on the live
+    // Firebase project don't yet include the "systemLogs" node rule (it has
+    // to be pasted into Firebase Console > Realtime Database > Rules
+    // manually — this app can't deploy rules by itself). Surface that
+    // clearly instead of silently showing an empty table.
+    state.systemLogsError = (e && e.message) || 'সিস্টেম লগ লোড করা যায়নি';
+    state.systemLogs = [];
+  }
+  renderCurrentView();
+}
 async function loadAllData() {
   state.loading = true; state.dbError = null; renderCurrentView();
   try {
@@ -518,16 +536,24 @@ async function loadAllData() {
 
     if (state.user.role === 'admin' || state.user.role === 'uno') {
       // Main Admin AND UNO have identical data-read access (see the Security
-      // Rules block) — loads everything. systemLogs is Main-Admin-exclusive
-      // (per the "system-management privilege" requirement) so only admin loads it.
-      const tasks = [dbGet('dealers'), dbGet('distributions'), dbGet('duplicateAttempts')];
-      if (state.user.role === 'admin') tasks.push(dbGet('uno'), dbGet('systemLogs'));
-      const [dealersObj, distObj, dupObj, unoObj, logsObj] = await Promise.all(tasks);
+      // Rules block) — loads everything critical to the dashboard first.
+      const [dealersObj, distObj, dupObj] = await Promise.all([dbGet('dealers'), dbGet('distributions'), dbGet('duplicateAttempts')]);
       state.dealers = objToArray(dealersObj);
       state.distributions = objToArray(distObj).sort((a, b) => new Date(b.date) - new Date(a.date));
       state.duplicates = objToArray(dupObj).sort((a, b) => (b.createdAt || 0) - (a.createdAt || 0));
-      state.unos = state.user.role === 'admin' ? objToArray(unoObj) : [];
-      state.systemLogs = state.user.role === 'admin' ? objToArray(logsObj).sort((a, b) => (b.timestamp || 0) - (a.timestamp || 0)) : [];
+      state.unos = [];
+      state.systemLogs = [];
+      if (state.user.role === 'admin') {
+        // uno/systemLogs are Main-Admin-exclusive and loaded SEPARATELY on
+        // purpose: if their Security Rules aren't set up correctly yet (a
+        // common setup step people forget), that failure must not take down
+        // the rest of the admin dashboard — it only affects these two.
+        try {
+          const unoObj = await dbGet('uno');
+          state.unos = objToArray(unoObj);
+        } catch (e) { state.unos = []; }
+        await loadSystemLogsOnly();
+      }
     } else {
       // Any signed-in dealer can READ the shared distributions/duplicateAttempts
       // logs (needed for cross-dealer duplicate detection & farmer search),
@@ -619,10 +645,10 @@ onAuthStateChanged(auth, async (fbUser) => {
       }
     }
     currentView = 'dashboard';
+    writeSystemLog('login', 'login_success', `${ROLE_LABELS[state.user.role] || state.user.role} হিসেবে লগইন করেছেন`);
     renderShell();
     await loadAllData();
     resetInactivityTimer();
-    writeSystemLog('login', 'login_success', `${ROLE_LABELS[state.user.role] || state.user.role} হিসেবে লগইন করেছেন`);
   } catch (e) {
     showToast('প্রোফাইল লোড করা যায়নি। নেটওয়ার্ক বা Firebase Rules চেক করুন।', 'error');
   }
@@ -1692,6 +1718,7 @@ function renderSystemLogs() {
   rows = rows.slice().sort((a, b) => (b.timestamp || 0) - (a.timestamp || 0));
   return `
     <div class="page-header"><h2>সিস্টেম লগ</h2><button class="btn btn-outline btn-sm" data-action="export-logs">${ic('export', 'icon-sm')} CSV এক্সপোর্ট</button></div>
+    ${state.systemLogsError ? `<div class="duplicate-alert" style="border-color:#C62828;background:#FDECEA;">${ic('warn')}<div><h4>সিস্টেম লগ লোড করা যায়নি</h4><p>এর সবচেয়ে সাধারণ কারণ: Firebase Console-এ Realtime Database Rules-এ এখনো "systemLogs" node-এর নিয়ম যোগ করা হয়নি। Firebase Console → Realtime Database → Rules-এ গিয়ে সর্বশেষ Rules paste করে Publish করুন, তারপর নিচের বাটনে চাপুন।<br><span class="muted" style="font-size:11.5px;">টেকনিক্যাল বার্তা: ${esc(state.systemLogsError)}</span><br><button type="button" class="btn btn-outline btn-sm" data-action="retry-load-logs" style="margin-top:8px;">আবার চেষ্টা করুন</button></div></div>` : ''}
     <div class="login-tabs" style="flex-wrap:wrap;max-width:900px;margin-bottom:14px;height:auto;">
       ${Object.entries(LOG_CATEGORIES).map(([k, l]) => `<div class="login-tab ${active === k ? 'active' : ''}" data-action="set-log-filter" data-type="${k}" style="flex:none;padding:8px 14px;">${esc(l)}</div>`).join('')}
     </div>
@@ -1780,6 +1807,7 @@ document.getElementById('mainApp').addEventListener('click', async (e) => {
     case 'export-report': exportReportCSV(); break;
     case 'set-report-type': state.reportType = target.dataset.type; renderCurrentView(); break;
     case 'retry-charts': initDashboardCharts(); break;
+    case 'retry-load-logs': await loadSystemLogsOnly(); break;
     case 'add-fert-row': addFertRow(); break;
     case 'remove-fert-row': removeFertRow(target); break;
     case 'search-farmer': {
