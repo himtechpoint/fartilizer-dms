@@ -81,6 +81,7 @@
   .btn-sm{padding:6px 12px;font-size:13px;border-radius:8px;}
   .btn:disabled{opacity:.55;cursor:not-allowed;}
   input,select,textarea{width:100%;padding:10px 12px;border-radius:10px;border:1.5px solid var(--border);background:#fff;font-size:14.5px;outline:none;}
+  input[readonly],select:disabled{background:#F0F2EE;color:var(--text-muted);cursor:not-allowed;}
   input:focus,select:focus,textarea:focus{border-color:var(--secondary);box-shadow:0 0 0 3px rgba(76,175,80,0.15);}
   label{display:block;font-size:13px;font-weight:600;color:var(--text-muted);margin-bottom:6px;}
   .field{margin-bottom:14px;}
@@ -1268,7 +1269,7 @@ function renderDistributionForm() {
           <div class="field"><label>মোবাইল নম্বর</label><input type="tel" name="mobile" pattern="01[0-9]{9}" placeholder="01XXXXXXXXX" required></div>
           <div class="field"><label>গ্রাম (ঐচ্ছিক)</label><input type="text" name="village"></div>
         </div>
-        <div class="field"><label>ইউনিয়ন</label><select name="union" required><option value="">-- নির্বাচন করুন --</option>${UNIONS.map(u => `<option value="${esc(u)}" ${u === state.user.union ? 'selected' : ''}>${esc(u)}</option>`).join('')}</select></div>
+        <div class="field"><label>ইউনিয়ন</label><input type="text" name="union" value="${esc(state.user.union)}" readonly><p class="muted" style="margin:4px 0 0;font-size:11.5px;">আপনার নির্ধারিত এলাকা অনুযায়ী স্বয়ংক্রিয়ভাবে সেট — পরিবর্তন করতে হলে অ্যাডমিনের সাথে যোগাযোগ করুন।</p></div>
 
         <div class="field-section-title">জমির তথ্য</div>
         <div class="form-grid cols-2">
@@ -1304,7 +1305,7 @@ function renderDistributionForm() {
         </div>
         <button type="button" class="btn btn-outline btn-sm" data-action="add-fert-row" style="margin-bottom:16px;">+ আরেকটি সার যোগ করুন</button>
 
-        <div class="field"><label>বিতরণের তারিখ</label><input type="date" name="date" max="${todayStr()}" value="${todayStr()}" required></div>
+        <div class="field"><label>বিতরণের তারিখ</label><input type="date" name="date" value="${todayStr()}" readonly></div>
         <div class="field"><label>মন্তব্য (ঐচ্ছিক)</label><textarea name="remarks" rows="2"></textarea></div>
         <button type="submit" class="btn btn-primary" id="distSubmitBtn" style="width:100%;">সংরক্ষণ করুন</button>
       </form>
