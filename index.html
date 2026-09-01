@@ -6,7 +6,7 @@
 <title>উপজেলা সার বিতরণ ব্যবস্থাপনা সিস্টেম</title>
 <link rel="preconnect" href="https://fonts.googleapis.com">
 <link href="https://fonts.googleapis.com/css2?family=Hind+Siliguri:wght@400;500;600;700&display=swap" rel="stylesheet">
-<script src="https://cdnjs.cloudflare.com/ajax/libs/Chart.js/4.4.1/chart.min.js" onerror="var s=document.createElement('script');s.src='https://cdn.jsdelivr.net/npm/chart.js@4.4.1/dist/chart.umd.min.js';document.head.appendChild(s);"></script>
+<script src="https://cdnjs.cloudflare.com/ajax/libs/Chart.js/4.4.1/chart.min.js" onerror="var s=document.createElement('script');s.src='https://cdn.jsdelivr.net/npm/chart.js@4.4.1/dist/chart.umd.min.js';s.onerror=function(){var s2=document.createElement('script');s2.src='https://unpkg.com/chart.js@4.4.1/dist/chart.umd.min.js';document.head.appendChild(s2);};document.head.appendChild(s);"></script>
 <style>
   :root{
     --primary:#2E7D32;
@@ -818,17 +818,36 @@ function renderTopDealers() {
       <span class="badge badge-green">${d.count} বিতরণ</span>
     </div>`).join('');
 }
-function showChartMessage(canvasId, text, isError) {
+function showChartMessage(canvasId, text, isError, showRetry) {
   const canvas = document.getElementById(canvasId);
   if (!canvas) return;
   canvas.style.display = 'none';
   const wrap = canvas.parentElement;
+  const old = wrap.querySelector('.chart-msg');
+  if (old) old.remove();
   const msg = document.createElement('div');
   msg.className = 'chart-msg' + (isError ? ' error' : '');
-  msg.textContent = text;
+  msg.innerHTML = esc(text) + (showRetry ? `<br><button type="button" class="btn btn-outline btn-sm" data-action="retry-charts" style="margin-top:8px;">আবার চেষ্টা করুন</button>` : '');
   wrap.appendChild(msg);
 }
-function initDashboardCharts() {
+// Chart.js is loaded via a classic (blocking) <script> tag, but its onerror
+// fallback (loading a second/third CDN) injects a NEW script tag with
+// document.head.appendChild — that load happens asynchronously and does NOT
+// block page parsing, so `typeof Chart` can still be 'undefined' for a few
+// seconds after this deferred module script has already started running,
+// especially on a slow connection. So instead of checking once, poll for a
+// short window before giving up.
+function waitForChart(timeoutMs) {
+  return new Promise((resolve) => {
+    if (typeof Chart !== 'undefined') { resolve(true); return; }
+    const start = Date.now();
+    const iv = setInterval(() => {
+      if (typeof Chart !== 'undefined') { clearInterval(iv); resolve(true); }
+      else if (Date.now() - start > timeoutMs) { clearInterval(iv); resolve(false); }
+    }, 200);
+  });
+}
+async function initDashboardCharts() {
   // Always start from a clean slate: destroy any previous Chart.js
   // instances (even ones bound to now-detached canvases from a prior
   // render) before touching the freshly-rendered canvas elements.
@@ -836,12 +855,20 @@ function initDashboardCharts() {
   charts = {};
 
   const CHART_IDS = ['chartFertilizer', 'chartUnion', 'chartMonthly'];
+  const thisRenderView = currentView;
   if (typeof Chart === 'undefined') {
-    CHART_IDS.forEach(id => showChartMessage(id, 'চার্ট লাইব্রেরি লোড করা যায়নি। ইন্টারনেট সংযোগ চেক করে পেজ রিফ্রেশ করুন।', true));
-    return;
+    CHART_IDS.forEach(id => showChartMessage(id, 'চার্ট লাইব্রেরি লোড হচ্ছে...', false, false));
+    const ready = await waitForChart(20000); // generous timeout for slow/rural connections
+    // If the user navigated away while we were waiting, don't touch a
+    // canvas that no longer belongs to the currently-rendered page.
+    if (currentView !== thisRenderView) return;
+    if (!ready) {
+      CHART_IDS.forEach(id => showChartMessage(id, 'চার্ট লাইব্রেরি লোড করা যায়নি। ইন্টারনেট সংযোগ চেক করুন।', true, true));
+      return;
+    }
   }
   if (!state.distributions.length) {
-    CHART_IDS.forEach(id => showChartMessage(id, 'এখনো কোনো বিতরণ তথ্য নেই।', false));
+    CHART_IDS.forEach(id => showChartMessage(id, 'এখনো কোনো বিতরণ তথ্য নেই।', false, false));
     return;
   }
 
@@ -856,15 +883,15 @@ function initDashboardCharts() {
   try {
     const ctx1 = document.getElementById('chartFertilizer');
     if (ctx1) charts.fert = new Chart(ctx1, { type: 'doughnut', data: { labels: FERTILIZERS.map(f => f.v), datasets: [{ data: FERTILIZERS.map(f => fertTotals[f.v]), backgroundColor: FERTILIZER_COLORS }] }, options: { responsive: true, maintainAspectRatio: false, plugins: { legend: { position: 'bottom', labels: { font: { family: 'Hind Siliguri' }, boxWidth: 12 } } } } });
-  } catch (e) { showChartMessage('chartFertilizer', 'চার্ট তৈরি করা যায়নি।', true); }
+  } catch (e) { showChartMessage('chartFertilizer', 'চার্ট তৈরি করা যায়নি।', true, true); }
   try {
     const ctx2 = document.getElementById('chartUnion');
     if (ctx2) charts.uni = new Chart(ctx2, { type: 'bar', data: { labels: UNIONS.map(u => u.split(' ')[0]), datasets: [{ label: 'কেজি', data: UNIONS.map(u => unionTotals[u]), backgroundColor: '#4CAF50', borderRadius: 6 }] }, options: { responsive: true, maintainAspectRatio: false, plugins: { legend: { display: false } }, scales: { y: { beginAtZero: true } } } });
-  } catch (e) { showChartMessage('chartUnion', 'চার্ট তৈরি করা যায়নি।', true); }
+  } catch (e) { showChartMessage('chartUnion', 'চার্ট তৈরি করা যায়নি।', true, true); }
   try {
     const ctx3 = document.getElementById('chartMonthly');
     if (ctx3) charts.month = new Chart(ctx3, { type: 'line', data: { labels: monthKeys, datasets: [{ label: 'মোট সার (কেজি)', data: monthKeys.map(k => monthlyMap[k]), borderColor: '#2E7D32', backgroundColor: 'rgba(46,125,50,0.15)', fill: true, tension: 0.35 }] }, options: { responsive: true, maintainAspectRatio: false, plugins: { legend: { display: false } }, scales: { y: { beginAtZero: true } } } });
-  } catch (e) { showChartMessage('chartMonthly', 'চার্ট তৈরি করা যায়নি।', true); }
+  } catch (e) { showChartMessage('chartMonthly', 'চার্ট তৈরি করা যায়নি।', true, true); }
 }
 
 /* ---------------- add dealer ---------------- */
@@ -1180,56 +1207,109 @@ function closeModal() {
 }
 
 /* ---------------- distribution form + duplicate detection ---------------- */
-function renderDistributionForm(prefill) {
-  const p = prefill || {};
-  const showDup = !!p.existingDate;
+function renderDistributionForm() {
   return `
     <div class="page-header"><h2>সার বিতরণ করুন</h2></div>
-    ${showDup ? `<div class="duplicate-alert">${ic('warn')}<div><h4>এই কৃষক ইতোমধ্যে এই মাসে এই সার গ্রহণ করেছেন</h4><p>কৃষক: ${esc(p.farmerName)} | এনআইডি: ${esc(p.nid)} | পূর্বের বিতরণের তারিখ: ${formatDate(p.existingDate)} | ডিলার: ${esc(p.existingDealer)}</p></div></div>` : ''}
+    <div id="distDuplicateWarning" class="duplicate-alert" style="display:none;"></div>
     <div class="glass-card" style="max-width:640px;">
       <form id="distributionForm">
         <div class="form-grid cols-2">
-          <div class="field"><label>কৃষকের নাম</label><input type="text" name="farmerName" value="${esc(p.farmerName || '')}" required></div>
-          <div class="field"><label>এনআইডি নম্বর</label><input type="text" name="nid" value="${esc(p.nid || '')}" inputmode="numeric" pattern="[0-9]{10,17}" required></div>
+          <div class="field"><label>কৃষকের নাম</label><input type="text" name="farmerName" required></div>
+          <div class="field"><label>এনআইডি নম্বর</label><input type="text" name="nid" inputmode="numeric" pattern="[0-9]{10,17}" required></div>
         </div>
         <div class="form-grid cols-2">
-          <div class="field"><label>মোবাইল নম্বর</label><input type="tel" name="mobile" value="${esc(p.mobile || '')}" pattern="01[0-9]{9}" placeholder="01XXXXXXXXX" required></div>
-          <div class="field"><label>গ্রাম (ঐচ্ছিক)</label><input type="text" name="village" value="${esc(p.village || '')}"></div>
+          <div class="field"><label>মোবাইল নম্বর</label><input type="tel" name="mobile" pattern="01[0-9]{9}" placeholder="01XXXXXXXXX" required></div>
+          <div class="field"><label>গ্রাম (ঐচ্ছিক)</label><input type="text" name="village"></div>
         </div>
-        <div class="field"><label>ইউনিয়ন</label><select name="union" required><option value="">-- নির্বাচন করুন --</option>${UNIONS.map(u => `<option value="${esc(u)}" ${u === (p.union || state.user.union) ? 'selected' : ''}>${esc(u)}</option>`).join('')}</select></div>
+        <div class="field"><label>ইউনিয়ন</label><select name="union" required><option value="">-- নির্বাচন করুন --</option>${UNIONS.map(u => `<option value="${esc(u)}" ${u === state.user.union ? 'selected' : ''}>${esc(u)}</option>`).join('')}</select></div>
 
         <div class="field-section-title">জমির তথ্য</div>
         <div class="form-grid cols-2">
-          <div class="field"><label>জমির পরিমাণ (শতাংশ)${reqMark('landArea')}</label><input type="number" name="landArea" min="0.01" step="0.01" value="${p.landArea || ''}" ${reqAttr('landArea')}></div>
-          <div class="field"><label>মৌজা নাম${reqMark('mouza')}</label><input type="text" name="mouza" value="${esc(p.mouza || '')}" ${reqAttr('mouza')}></div>
+          <div class="field"><label>জমির পরিমাণ (শতাংশ)${reqMark('landArea')}</label><input type="number" name="landArea" min="0.01" step="0.01" ${reqAttr('landArea')}></div>
+          <div class="field"><label>মৌজা নাম${reqMark('mouza')}</label><input type="text" name="mouza" ${reqAttr('mouza')}></div>
         </div>
         <div class="form-grid cols-2">
-          <div class="field"><label>জমি দাগ নম্বর${reqMark('dagNumber')}</label><input type="text" name="dagNumber" value="${esc(p.dagNumber || '')}" ${reqAttr('dagNumber')}></div>
-          <div class="field"><label>খতিয়ান নং${reqMark('khatianNumber')}</label><input type="text" name="khatianNumber" value="${esc(p.khatianNumber || '')}" ${reqAttr('khatianNumber')}></div>
+          <div class="field"><label>জমি দাগ নম্বর${reqMark('dagNumber')}</label><input type="text" name="dagNumber" ${reqAttr('dagNumber')}></div>
+          <div class="field"><label>খতিয়ান নং${reqMark('khatianNumber')}</label><input type="text" name="khatianNumber" ${reqAttr('khatianNumber')}></div>
         </div>
         <div class="field">
           <label>ফসলের নাম${reqMark('cropName')}</label>
           <select name="cropName" ${reqAttr('cropName')}>
             <option value="">-- নির্বাচন করুন --</option>
-            ${CROPS.map(c => `<option value="${esc(c)}" ${c === (p.cropSelect || (p.cropName === CROP_CUSTOM_VALUE ? CROP_CUSTOM_VALUE : (CROPS.includes(p.cropName) ? p.cropName : ''))) ? 'selected' : ''}>${esc(c)}</option>`).join('')}
+            ${CROPS.map(c => `<option value="${esc(c)}">${esc(c)}</option>`).join('')}
           </select>
         </div>
-        <div class="field" id="cropCustomField" style="${(p.cropSelect || p.cropName) === CROP_CUSTOM_VALUE ? '' : 'display:none;'}">
+        <div class="field" id="cropCustomField" style="display:none;">
           <label>ফসলের নাম লিখুন</label>
-          <input type="text" name="cropNameCustom" value="${esc(p.cropNameCustom || (p.cropSelect === CROP_CUSTOM_VALUE ? p.cropName : '') || '')}" ${(p.cropSelect || p.cropName) === CROP_CUSTOM_VALUE ? 'required' : ''}>
+          <input type="text" name="cropNameCustom">
         </div>
 
         <div class="field-section-title">সারের তথ্য</div>
-        <div class="form-grid cols-2">
-          <div class="field"><label>সারের নাম</label><select name="fertilizer" required><option value="">-- নির্বাচন করুন --</option>${FERTILIZERS.map(f => `<option value="${esc(f.v)}" ${f.v === p.fertilizer ? 'selected' : ''}>${esc(f.l)}</option>`).join('')}</select></div>
-          <div class="field"><label>পরিমাণ (কেজি)</label><input type="number" name="quantity" value="${p.quantity || ''}" min="0.5" step="0.5" required></div>
+        <p class="muted" style="margin-top:-6px;margin-bottom:10px;">একই বিতরণে একজন কৃষককে একাধিক (সর্বোচ্চ ${FERTILIZERS.length} টি) ভিন্ন সার একসাথে দেওয়া যাবে — নিচে "আরেকটি সার যোগ করুন" চাপুন।</p>
+        <div id="fertilizerRows">
+          <div class="fert-row form-grid cols-2" style="margin-bottom:10px;">
+            <div class="field" style="margin-bottom:0;"><label>সারের নাম</label><select name="fertilizer[]" required><option value="">-- নির্বাচন করুন --</option>${FERTILIZERS.map(f => `<option value="${esc(f.v)}">${esc(f.l)}</option>`).join('')}</select></div>
+            <div class="field" style="margin-bottom:0;display:flex;gap:8px;align-items:flex-end;">
+              <div style="flex:1;"><label>পরিমাণ (কেজি)</label><input type="number" name="quantity[]" min="0.5" step="0.5" required></div>
+              <button type="button" class="btn btn-outline btn-sm" data-action="remove-fert-row" style="display:none;">✕</button>
+            </div>
+          </div>
         </div>
-        <div class="field"><label>বিতরণের তারিখ</label><input type="date" name="date" max="${todayStr()}" value="${p.date || todayStr()}" required></div>
-        <div class="field"><label>মন্তব্য (ঐচ্ছিক)</label><textarea name="remarks" rows="2">${esc(p.remarks || '')}</textarea></div>
+        <button type="button" class="btn btn-outline btn-sm" data-action="add-fert-row" style="margin-bottom:16px;">+ আরেকটি সার যোগ করুন</button>
+
+        <div class="field"><label>বিতরণের তারিখ</label><input type="date" name="date" max="${todayStr()}" value="${todayStr()}" required></div>
+        <div class="field"><label>মন্তব্য (ঐচ্ছিক)</label><textarea name="remarks" rows="2"></textarea></div>
         <button type="submit" class="btn btn-primary" id="distSubmitBtn" style="width:100%;">সংরক্ষণ করুন</button>
       </form>
     </div>
   `;
+}
+function fertRowTemplate() {
+  return `
+    <div class="field" style="margin-bottom:0;"><label>সারের নাম</label><select name="fertilizer[]" required><option value="">-- নির্বাচন করুন --</option>${FERTILIZERS.map(f => `<option value="${esc(f.v)}">${esc(f.l)}</option>`).join('')}</select></div>
+    <div class="field" style="margin-bottom:0;display:flex;gap:8px;align-items:flex-end;">
+      <div style="flex:1;"><label>পরিমাণ (কেজি)</label><input type="number" name="quantity[]" min="0.5" step="0.5" required></div>
+      <button type="button" class="btn btn-outline btn-sm" data-action="remove-fert-row">✕</button>
+    </div>`;
+}
+function addFertRow() {
+  const container = document.getElementById('fertilizerRows');
+  if (!container) return;
+  const rows = container.querySelectorAll('.fert-row');
+  if (rows.length >= FERTILIZERS.length) { showToast(`সর্বোচ্চ ${FERTILIZERS.length} টি সার একসাথে যোগ করা যাবে`, 'error'); return; }
+  const row = document.createElement('div');
+  row.className = 'fert-row form-grid cols-2';
+  row.style.marginBottom = '10px';
+  row.innerHTML = fertRowTemplate();
+  container.appendChild(row);
+  updateFertRowRemoveButtons();
+}
+function removeFertRow(target) {
+  const container = document.getElementById('fertilizerRows');
+  const row = target.closest('.fert-row');
+  if (!row || !container) return;
+  if (container.querySelectorAll('.fert-row').length <= 1) return; // always keep at least one row
+  row.remove();
+  updateFertRowRemoveButtons();
+}
+function updateFertRowRemoveButtons() {
+  const container = document.getElementById('fertilizerRows');
+  if (!container) return;
+  const rows = container.querySelectorAll('.fert-row');
+  rows.forEach(r => {
+    const btn = r.querySelector('[data-action="remove-fert-row"]');
+    if (btn) btn.style.display = rows.length > 1 ? '' : 'none';
+  });
+}
+function showDuplicateWarning(dupItems) {
+  const el = document.getElementById('distDuplicateWarning');
+  if (!el) return;
+  el.style.display = 'flex';
+  el.innerHTML = `${ic('warn')}<div><h4>এই কৃষক ইতোমধ্যে এই মাসে নিচের সার গ্রহণ করেছেন</h4><p>${dupItems.map(d => `${esc(fertilizerLabel(d.fertilizer))} — পূর্বের তারিখ: ${formatDate(d.dup.date)}, ডিলার: ${esc(d.dup.dealerName)}`).join('<br>')}</p></div>`;
+}
+function hideDuplicateWarning() {
+  const el = document.getElementById('distDuplicateWarning');
+  if (el) { el.style.display = 'none'; el.innerHTML = ''; }
 }
 function findDuplicate(nid, fertilizer, dateStr) {
   const mk = monthKey(dateStr);
@@ -1237,6 +1317,7 @@ function findDuplicate(nid, fertilizer, dateStr) {
 }
 async function handleDistributionSubmit(form) {
   if (isSubmitting) return;
+  hideDuplicateWarning();
   const cropSelect = form.cropName.value;
   const cropCustom = form.cropNameCustom ? form.cropNameCustom.value.trim() : '';
   const landAreaRaw = form.landArea.value;
@@ -1252,8 +1333,6 @@ async function handleDistributionSubmit(form) {
     dagNumber: form.dagNumber.value.trim(),
     khatianNumber: form.khatianNumber.value.trim(),
     cropName: cropSelect === CROP_CUSTOM_VALUE ? cropCustom : cropSelect,
-    fertilizer: form.fertilizer.value,
-    quantity: parseFloat(form.quantity.value),
     date: form.date.value,
     remarks: form.remarks.value.trim(),
   };
@@ -1268,21 +1347,37 @@ async function handleDistributionSubmit(form) {
   if (isFieldRequired('khatianNumber') && !data.khatianNumber) { showToast('খতিয়ান নং দিন', 'error'); return; }
   if (isFieldRequired('cropName') && !cropSelect) { showToast('ফসলের নাম নির্বাচন করুন', 'error'); return; }
   if (cropSelect === CROP_CUSTOM_VALUE && !cropCustom) { showToast('ফসলের নাম লিখে দিন', 'error'); return; }
-  if (!data.fertilizer) { showToast('সারের নাম নির্বাচন করুন', 'error'); return; }
-  if (!data.quantity || data.quantity <= 0) { showToast('সঠিক পরিমাণ দিন (০ এর বেশি)', 'error'); return; }
   if (new Date(data.date) > new Date()) { showToast('ভবিষ্যতের তারিখ দেওয়া যাবে না', 'error'); return; }
 
+  // Collect every fertilizer row the dealer added (one farmer visit can now
+  // include several different fertilizers in a single submission).
+  const fertSelects = [...form.querySelectorAll('select[name="fertilizer[]"]')];
+  const qtyInputs = [...form.querySelectorAll('input[name="quantity[]"]')];
+  const items = fertSelects.map((sel, i) => ({ fertilizer: sel.value, quantity: parseFloat(qtyInputs[i].value) }));
+
+  if (!items.length) { showToast('অন্তত একটি সার যোগ করুন', 'error'); return; }
+  for (const it of items) {
+    if (!it.fertilizer) { showToast('প্রতিটি সারের নাম নির্বাচন করুন', 'error'); return; }
+    if (!it.quantity || it.quantity <= 0) { showToast('প্রতিটি সারের সঠিক পরিমাণ দিন (০ এর বেশি)', 'error'); return; }
+  }
+  if (new Set(items.map(i => i.fertilizer)).size !== items.length) {
+    showToast('একই সার একাধিকবার নির্বাচন করা যাবে না', 'error'); return;
+  }
+
   // dealerId/dealerName ALWAYS come from the authenticated Firebase user —
-  // never from anything typed into this form.
-  const dup = findDuplicate(data.nid, data.fertilizer, data.date);
-  if (dup) {
-    try {
-      await dbPush('duplicateAttempts', { ...data, dealerId: state.user.uid, dealerName: state.user.name, existingRecordId: dup.id, existingDate: dup.date, existingDealer: dup.dealerName, attemptType: 'duplicate_nid_month', createdAt: Date.now() });
-      state.duplicates.unshift({ ...data, dealerId: state.user.uid, dealerName: state.user.name, createdAt: Date.now() });
-      writeSystemLog('data_entry', 'duplicate_attempt', `কৃষক: ${data.farmerName} | এনআইডি: ${data.nid} | সার: ${data.fertilizer}`);
-    } catch (e) { /* even if the log write fails, still block the save and show the warning */ }
-    document.getElementById('mainContent').innerHTML = renderDistributionForm({ ...data, cropSelect, cropNameCustom: cropCustom, existingDate: dup.date, existingDealer: dup.dealerName });
-    showToast('এই কৃষক ইতোমধ্যে এই মাসে এই সার গ্রহণ করেছেন', 'warn');
+  // never from anything typed into this form. Duplicate detection still
+  // runs per-fertilizer, exactly as before — just once per row now.
+  const dupItems = items.map(it => ({ ...it, dup: findDuplicate(data.nid, it.fertilizer, data.date) })).filter(x => x.dup);
+  if (dupItems.length) {
+    for (const di of dupItems) {
+      try {
+        await dbPush('duplicateAttempts', { ...data, fertilizer: di.fertilizer, quantity: di.quantity, dealerId: state.user.uid, dealerName: state.user.name, existingRecordId: di.dup.id, existingDate: di.dup.date, existingDealer: di.dup.dealerName, attemptType: 'duplicate_nid_month', createdAt: Date.now() });
+        state.duplicates.unshift({ ...data, fertilizer: di.fertilizer, quantity: di.quantity, dealerId: state.user.uid, dealerName: state.user.name, createdAt: Date.now() });
+      } catch (e) { /* even if the log write fails, still block the save and show the warning */ }
+    }
+    writeSystemLog('data_entry', 'duplicate_attempt', `কৃষক: ${data.farmerName} | এনআইডি: ${data.nid} | সার: ${dupItems.map(d => d.fertilizer).join(', ')}`);
+    showDuplicateWarning(dupItems);
+    showToast('এক বা একাধিক সার ইতোমধ্যে এই মাসে গ্রহণ করা হয়েছে — বাকিগুলো সংরক্ষণ করা হয়নি', 'warn');
     return;
   }
 
@@ -1290,11 +1385,21 @@ async function handleDistributionSubmit(form) {
   const btn = document.getElementById('distSubmitBtn');
   if (btn) { btn.disabled = true; btn.textContent = 'সংরক্ষণ হচ্ছে...'; }
   try {
-    const record = { ...data, dealerId: state.user.uid, dealerName: state.user.name, createdAt: Date.now() };
-    const res = await dbPush('distributions', record);
-    state.distributions.unshift({ id: res.name, ...record });
-    showToast('সফলভাবে সংরক্ষণ করা হয়েছে', 'success');
-    writeSystemLog('data_entry', 'distribution_created', `কৃষক: ${data.farmerName} | সার: ${data.fertilizer} | ${data.quantity} কেজি`);
+    // Each fertilizer becomes its own distribution record (so every existing
+    // report, chart, CSV export and duplicate check — all built around
+    // "one record = one fertilizer" — keeps working unchanged); a shared
+    // batchId just ties same-visit records together for future reference.
+    const batchId = 'b' + Date.now().toString(36) + Math.random().toString(36).slice(2, 7);
+    const createdAt = Date.now();
+    const newRecords = [];
+    for (const it of items) {
+      const record = { ...data, fertilizer: it.fertilizer, quantity: it.quantity, dealerId: state.user.uid, dealerName: state.user.name, batchId, createdAt };
+      const res = await dbPush('distributions', record);
+      newRecords.push({ id: res.name, ...record });
+    }
+    state.distributions.unshift(...newRecords);
+    showToast(`সফলভাবে সংরক্ষণ করা হয়েছে (${items.length} টি সার)`, 'success');
+    writeSystemLog('data_entry', 'distribution_created', `কৃষক: ${data.farmerName} | ${items.length} টি সার (${items.map(i => i.fertilizer).join(', ')})`);
     renderCurrentView();
   } catch (e) {
     showToast('সংরক্ষণ করা যায়নি, নেটওয়ার্ক বা Firebase Rules চেক করুন', 'error');
@@ -1674,6 +1779,9 @@ document.getElementById('mainApp').addEventListener('click', async (e) => {
     case 'export-duplicates': exportDuplicatesCSV(); break;
     case 'export-report': exportReportCSV(); break;
     case 'set-report-type': state.reportType = target.dataset.type; renderCurrentView(); break;
+    case 'retry-charts': initDashboardCharts(); break;
+    case 'add-fert-row': addFertRow(); break;
+    case 'remove-fert-row': removeFertRow(target); break;
     case 'search-farmer': {
       const input = document.getElementById('farmerSearchInput');
       performFarmerSearch(input ? input.value.trim() : '');
