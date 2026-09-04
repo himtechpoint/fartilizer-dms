@@ -325,7 +325,9 @@ import {
   EmailAuthProvider, reauthenticateWithCredential, updatePassword
 } from "https://www.gstatic.com/firebasejs/10.12.2/firebase-auth.js";
 import {
-  getDatabase, ref, get, set, update, push, remove
+  getDatabase, ref, get, set, update, push, remove,
+  query, orderByChild, equalTo, limitToFirst, limitToLast,
+  startAt, startAfter, endAt, endBefore
 } from "https://www.gstatic.com/firebasejs/10.12.2/firebase-database.js";
 import { getAnalytics, isSupported as analyticsIsSupported } from "https://www.gstatic.com/firebasejs/10.12.2/firebase-analytics.js";
 
@@ -407,6 +409,21 @@ const state = {
   logFilter: 'all',
   farmerSearchResults: null,
 };
+/* ---------------- distribution-history pagination state ----------------
+   Distribution History (admin/UNO) and Dealer History no longer read from
+   state.distributions (which stays as-is for dashboard/reports/search per
+   spec #8). Instead they page directly from Firebase, 500 records/page,
+   using true server-side query()+limitToFirst/limitToLast — never loading
+   the whole 70K+ dataset into the browser. */
+const PAGE_SIZE = 500;
+const distPage = {
+  rows: [],
+  pageNumber: 1,        // 1-based, shown to the user
+  cursorStack: [null],  // cursorStack[i] = the query cursor that produced page i+1's FIRST row
+  hasNext: false,
+  loading: false,
+  error: null,
+};
 let currentView = 'dashboard';
 let charts = {};
 let inactivityTimer = null;
@@ -474,6 +491,131 @@ async function dbUpdate(path, data) {
 async function dbSet(path, data) {
   await set(ref(db, path), data);
   return true;
+}
+
+/* =========================================================================
+   DISTRIBUTION HISTORY — true server-side pagination (500 records/page)
+   =========================================================================
+   Firebase Realtime Database only allows ONE orderByChild() and ONE pair of
+   range bounds (a single start-type + a single end-type constraint) per
+   query, so when a filter is active we pick ONE indexed field to query on
+   (priority: union > dealer > fertilizer > date-only), fetch just that
+   field's matching page from the server (max 500/2000 rows), and apply any
+   REMAINING filters to that single page only, client-side. The server is
+   NEVER asked for the whole distributions table, no matter how large it
+   grows. Requires these Realtime Database indexes (see rules note below):
+     distributions: .indexOn: ["date","union","dealerId","fertilizer"]
+   ========================================================================= */
+function distIndexField(filters, forDealer) {
+  if (forDealer) return { field: 'dealerId', value: filters._dealerUid };
+  if (filters.union) return { field: 'union', value: filters.union };
+  if (filters.dealer) return { field: 'dealerId', value: filters.dealer };
+  if (filters.fertilizer) return { field: 'fertilizer', value: filters.fertilizer };
+  if (filters.dateFrom || filters.dateTo) return { field: 'date' };
+  return { field: null };
+}
+function remainingClientFilters(rows, filters, indexField) {
+  return rows.filter(r => {
+    if (indexField !== 'union' && filters.union && r.union !== filters.union) return false;
+    if (indexField !== 'dealerId' && filters.dealer && r.dealerId !== filters.dealer) return false;
+    if (indexField !== 'fertilizer' && filters.fertilizer && r.fertilizer !== filters.fertilizer) return false;
+    if (filters.dateFrom && r.date < filters.dateFrom) return false;
+    if (filters.dateTo && r.date > filters.dateTo) return false;
+    return true;
+  });
+}
+async function runDistIndexedQuery(idx, filters, direction, cursor) {
+  const base = ref(db, 'distributions');
+  let q;
+  if (!idx.field) {
+    // No filter at all → newest-first via limitToLast, older pages via endBefore cursor.
+    if (direction === 'first') q = query(base, orderByChild('date'), limitToLast(PAGE_SIZE));
+    else q = query(base, orderByChild('date'), endBefore(cursor.date, cursor.key), limitToLast(PAGE_SIZE));
+  } else if (idx.field === 'date') {
+    const endBound = (filters.dateTo || '') + '\uf8ff';
+    if (direction === 'first') q = query(base, orderByChild('date'), startAt(filters.dateFrom || ''), endAt(endBound), limitToFirst(PAGE_SIZE));
+    else q = query(base, orderByChild('date'), startAfter(cursor.date, cursor.key), endAt(endBound), limitToFirst(PAGE_SIZE));
+  } else {
+    if (direction === 'first') q = query(base, orderByChild(idx.field), startAt(idx.value), endAt(idx.value), limitToFirst(PAGE_SIZE));
+    else q = query(base, orderByChild(idx.field), startAfter(idx.value, cursor.key), endAt(idx.value), limitToFirst(PAGE_SIZE));
+  }
+  const snap = await get(q);
+  const rows = objToArray(snap.exists() ? snap.val() : null);
+  rows.sort((a, b) => new Date(b.date) - new Date(a.date));
+  return rows;
+}
+async function fetchDistPage(direction) {
+  distPage.loading = true; distPage.error = null;
+  renderCurrentView();
+  try {
+    const forDealer = state.user.role === 'dealer';
+    const filters = forDealer ? { ...state.filters, _dealerUid: state.user.id, dealer: '' } : state.filters;
+    const idx = distIndexField(filters, forDealer);
+    let cursor = null;
+    if (direction === 'next') cursor = distPage.cursorStack[distPage.pageNumber];
+    if (direction === 'prev') cursor = distPage.cursorStack[distPage.pageNumber - 2] || null;
+    const effDirection = (direction === 'first' || (direction === 'prev' && !cursor)) ? 'first' : direction;
+    const rawRows = await runDistIndexedQuery(idx, filters, effDirection, cursor);
+
+    if (direction === 'first') { distPage.pageNumber = 1; distPage.cursorStack = [null]; }
+    else if (direction === 'next') { distPage.pageNumber += 1; }
+    else { distPage.pageNumber = Math.max(1, distPage.pageNumber - 1); }
+
+    if (rawRows.length) {
+      const last = rawRows[rawRows.length - 1];
+      distPage.cursorStack[distPage.pageNumber] = { date: last.date, key: last.id };
+    }
+    distPage.hasNext = rawRows.length === PAGE_SIZE;
+    distPage.rows = remainingClientFilters(rawRows, filters, idx.field);
+  } catch (e) {
+    distPage.error = (e && e.message) || 'ডেটা লোড করা যায়নি — ইন্টারনেট সংযোগ বা Firebase Rules/Index চেক করুন।';
+    distPage.rows = []; distPage.hasNext = false;
+  }
+  distPage.loading = false;
+  renderCurrentView();
+}
+function resetAndLoadDistPage() { fetchDistPage('first'); }
+
+/* ---- large CSV export: batched server-side reads (never the full table at once) ---- */
+function csvTextGuard(v) {
+  // Prevents Excel from turning long digit-only strings (NID numbers) into
+  // scientific notation or dropping digits when the .csv is opened directly
+  // in Excel. Excel evaluates any cell starting with "=" as a formula, so
+  // ="391071xxxxxxx" renders as the exact literal text, unmodified.
+  const s = String(v === undefined || v === null ? '' : v);
+  return /^\d{6,}$/.test(s) ? `="${s}"` : s;
+}
+async function fetchAllDistributionsForExport(filters, onProgress) {
+  const forDealer = state.user.role === 'dealer';
+  const effFilters = forDealer ? { ...filters, _dealerUid: state.user.id, dealer: '' } : filters;
+  const idx = distIndexField(effFilters, forDealer);
+  const base = ref(db, 'distributions');
+  const BATCH = 2000;
+  let all = [];
+  let cursorKey = null, lastDate = null, more = true, safety = 0;
+  while (more) {
+    let q;
+    if (!idx.field) {
+      q = cursorKey ? query(base, orderByChild('date'), startAfter(lastDate, cursorKey), limitToFirst(BATCH))
+                    : query(base, orderByChild('date'), limitToFirst(BATCH));
+    } else if (idx.field === 'date') {
+      const endBound = (effFilters.dateTo || '') + '\uf8ff';
+      q = cursorKey ? query(base, orderByChild('date'), startAfter(lastDate, cursorKey), endAt(endBound), limitToFirst(BATCH))
+                    : query(base, orderByChild('date'), startAt(effFilters.dateFrom || ''), endAt(endBound), limitToFirst(BATCH));
+    } else {
+      q = cursorKey ? query(base, orderByChild(idx.field), startAfter(idx.value, cursorKey), endAt(idx.value), limitToFirst(BATCH))
+                    : query(base, orderByChild(idx.field), startAt(idx.value), endAt(idx.value), limitToFirst(BATCH));
+    }
+    const snap = await get(q);
+    const batch = objToArray(snap.exists() ? snap.val() : null);
+    all = all.concat(remainingClientFilters(batch, effFilters, idx.field));
+    if (onProgress) onProgress(all.length);
+    if (batch.length < BATCH) { more = false; }
+    else { const last = batch[batch.length - 1]; cursorKey = last.id; lastDate = last.date; }
+    if (++safety > 500) break; // hard safety cap — covers up to ~1M rows
+  }
+  all.sort((a, b) => new Date(b.date) - new Date(a.date));
+  return all;
 }
 /* Every log entry is a "create-only, self-authored" write — any signed-in
    user may write a log row about their OWN action (uid must match
@@ -759,7 +901,11 @@ function navigateTo(view) {
   currentView = view;
   state.filters = { union: '', dealer: '', fertilizer: '', dateFrom: '', dateTo: '', search: '' };
   renderSidebar();
-  renderCurrentView();
+  if (view === 'distributions' || view === 'history') {
+    resetAndLoadDistPage(); // server-side paginated fetch (500/page), independent of state.distributions
+  } else {
+    renderCurrentView();
+  }
   closeMobileSidebar();
   document.getElementById('mainContent').scrollTop = 0;
 }
@@ -1478,14 +1624,26 @@ function renderDealerDashboard() {
     </div>
   `;
 }
+function renderDistPaginationBar() {
+  return `
+    <div class="row-between" style="margin-top:10px;flex-wrap:wrap;gap:8px;">
+      <div class="muted">এই পেজে ${distPage.rows.length} টি রেকর্ড দেখানো হচ্ছে (পেজ প্রতি সর্বোচ্চ ${PAGE_SIZE} টি) — পেজ ${distPage.pageNumber}</div>
+      <div style="display:flex;gap:8px;">
+        <button class="btn btn-outline btn-sm" data-action="dist-prev-page" ${distPage.pageNumber <= 1 || distPage.loading ? 'disabled' : ''}>← আগের পেজ</button>
+        <button class="btn btn-outline btn-sm" data-action="dist-next-page" ${!distPage.hasNext || distPage.loading ? 'disabled' : ''}>পরের পেজ →</button>
+      </div>
+    </div>
+  `;
+}
 function renderDealerHistory() {
-  let rows = state.distributions.filter(d => d.dealerId === state.user.id);
-  rows = applyCommonFilters(rows, { skipDealerFilter: true });
+  const rows = distPage.rows;
   return `
     <div class="page-header"><h2>বিতরণ ইতিহাস</h2></div>
-    ${renderFilterBar({ showDealer: false })}
+    ${renderFilterBar({ showDealer: false, showUnion: false })}
+    <div class="glass-card" style="margin-bottom:12px;"><span class="muted">আপনার এলাকা: <b>${esc(state.user.union)}</b> — শুধুমাত্র আপনার নিজের বিতরণের রেকর্ড এখানে দেখা যাবে।</span></div>
     <div class="glass-card table-wrap">
-      ${rows.length ? `<table class="data-table"><thead><tr><th>#</th><th>কৃষক</th><th>এনআইডি</th><th>মোবাইল</th><th>সার</th><th>পরিমাণ</th><th>গ্রাম</th><th>জমি(%)</th><th>মৌজা</th><th>দাগ</th><th>খতিয়ান</th><th>ফসল</th><th>তারিখ</th></tr></thead><tbody>${rows.map((r, i) => `<tr><td>${i + 1}</td><td>${esc(r.farmerName)}</td><td>${esc(r.nid)}</td><td>${esc(r.mobile)}</td><td>${esc(fertilizerLabel(r.fertilizer))}</td><td>${r.quantity} কেজি</td><td>${dashIfEmpty(r.village)}</td><td>${dashIfEmpty(r.landArea)}</td><td>${dashIfEmpty(r.mouza)}</td><td>${dashIfEmpty(r.dagNumber)}</td><td>${dashIfEmpty(r.khatianNumber)}</td><td>${dashIfEmpty(r.cropName)}</td><td>${formatDate(r.date)}</td></tr>`).join('')}</tbody></table>` : emptyState('কোনো রেকর্ড পাওয়া যায়নি।')}
+      ${distPage.loading ? `<div class="loading">তথ্য লোড হচ্ছে...</div>` : distPage.error ? `<div class="db-error"><strong>সংযোগ সমস্যা</strong><br>${esc(distPage.error)}<div style="margin-top:12px;"><button class="btn btn-outline btn-sm" data-action="dist-retry">আবার চেষ্টা করুন</button></div></div>` : rows.length ? `<table class="data-table"><thead><tr><th>#</th><th>কৃষক</th><th>এনআইডি</th><th>মোবাইল</th><th>সার</th><th>পরিমাণ</th><th>গ্রাম</th><th>জমি(%)</th><th>মৌজা</th><th>দাগ</th><th>খতিয়ান</th><th>ফসল</th><th>তারিখ</th></tr></thead><tbody>${rows.map((r, i) => `<tr><td>${i + 1}</td><td>${esc(r.farmerName)}</td><td>${esc(r.nid)}</td><td>${esc(r.mobile)}</td><td>${esc(fertilizerLabel(r.fertilizer))}</td><td>${r.quantity} কেজি</td><td>${dashIfEmpty(r.village)}</td><td>${dashIfEmpty(r.landArea)}</td><td>${dashIfEmpty(r.mouza)}</td><td>${dashIfEmpty(r.dagNumber)}</td><td>${dashIfEmpty(r.khatianNumber)}</td><td>${dashIfEmpty(r.cropName)}</td><td>${formatDate(r.date)}</td></tr>`).join('')}</tbody></table>` : emptyState('কোনো রেকর্ড পাওয়া যায়নি।')}
+      ${!distPage.loading && !distPage.error ? renderDistPaginationBar() : ''}
     </div>
   `;
 }
@@ -1533,9 +1691,10 @@ async function handleChangePasswordSubmit(form) {
 function renderFilterBar(opts) {
   opts = opts || {};
   const showDealer = opts.showDealer !== false;
+  const showUnion = opts.showUnion !== false;
   return `
     <div class="glass-card filter-bar">
-      <div class="field"><label>ইউনিয়ন</label><select data-filter="union"><option value="">সকল</option>${UNIONS.map(u => `<option value="${esc(u)}" ${state.filters.union === u ? 'selected' : ''}>${esc(u)}</option>`).join('')}</select></div>
+      ${showUnion ? `<div class="field"><label>ইউনিয়ন</label><select data-filter="union"><option value="">সকল</option>${UNIONS.map(u => `<option value="${esc(u)}" ${state.filters.union === u ? 'selected' : ''}>${esc(u)}</option>`).join('')}</select></div>` : ''}
       ${showDealer ? `<div class="field"><label>ডিলার</label><select data-filter="dealer"><option value="">সকল</option>${state.dealers.map(d => `<option value="${d.id}" ${state.filters.dealer === d.id ? 'selected' : ''}>${esc(d.name)}</option>`).join('')}</select></div>` : ''}
       <div class="field"><label>সার</label><select data-filter="fertilizer"><option value="">সকল</option>${FERTILIZERS.map(f => `<option value="${esc(f.v)}" ${state.filters.fertilizer === f.v ? 'selected' : ''}>${esc(f.l)}</option>`).join('')}</select></div>
       <div class="field"><label>তারিখ থেকে</label><input type="date" data-filter="dateFrom" value="${state.filters.dateFrom}"></div>
@@ -1555,13 +1714,13 @@ function applyCommonFilters(rows, opts) {
   });
 }
 function renderDistributionRecords() {
-  const rows = applyCommonFilters(state.distributions);
+  const rows = distPage.rows;
   return `
-    <div class="page-header"><h2>বিতরণ রেকর্ড</h2><button class="btn btn-outline btn-sm" data-action="export-distributions">${ic('export', 'icon-sm')} CSV এক্সপোর্ট</button></div>
+    <div class="page-header"><h2>বিতরণ রেকর্ড</h2><button class="btn btn-outline btn-sm" data-action="export-distributions">${ic('export', 'icon-sm')} CSV এক্সপোর্ট (ফিল্টার অনুযায়ী সব)</button></div>
     ${renderFilterBar()}
     <div class="glass-card table-wrap">
-      ${rows.length ? `<table class="data-table"><thead><tr><th>#</th><th>কৃষক</th><th>এনআইডি</th><th>মোবাইল</th><th>সার</th><th>পরিমাণ</th><th>ডিলার</th><th>ইউনিয়ন</th><th>জমি(%)</th><th>মৌজা</th><th>দাগ</th><th>খতিয়ান</th><th>ফসল</th><th>তারিখ</th></tr></thead><tbody>${rows.map((r, i) => `<tr><td>${i + 1}</td><td>${esc(r.farmerName)}</td><td>${esc(r.nid)}</td><td>${esc(r.mobile)}</td><td>${esc(fertilizerLabel(r.fertilizer))}</td><td>${r.quantity} কেজি</td><td>${esc(r.dealerName)}</td><td>${esc(r.union)}</td><td>${dashIfEmpty(r.landArea)}</td><td>${dashIfEmpty(r.mouza)}</td><td>${dashIfEmpty(r.dagNumber)}</td><td>${dashIfEmpty(r.khatianNumber)}</td><td>${dashIfEmpty(r.cropName)}</td><td>${formatDate(r.date)}</td></tr>`).join('')}</tbody></table>` : emptyState('কোনো রেকর্ড পাওয়া যায়নি।')}
-      <div class="muted" style="margin-top:10px;">মোট ${rows.length} টি রেকর্ড</div>
+      ${distPage.loading ? `<div class="loading">তথ্য লোড হচ্ছে...</div>` : distPage.error ? `<div class="db-error"><strong>সংযোগ সমস্যা</strong><br>${esc(distPage.error)}<div style="margin-top:12px;"><button class="btn btn-outline btn-sm" data-action="dist-retry">আবার চেষ্টা করুন</button></div></div>` : rows.length ? `<table class="data-table"><thead><tr><th>#</th><th>কৃষক</th><th>এনআইডি</th><th>মোবাইল</th><th>সার</th><th>পরিমাণ</th><th>ডিলার</th><th>ইউনিয়ন</th><th>জমি(%)</th><th>মৌজা</th><th>দাগ</th><th>খতিয়ান</th><th>ফসল</th><th>তারিখ</th></tr></thead><tbody>${rows.map((r, i) => `<tr><td>${i + 1}</td><td>${esc(r.farmerName)}</td><td>${esc(r.nid)}</td><td>${esc(r.mobile)}</td><td>${esc(fertilizerLabel(r.fertilizer))}</td><td>${r.quantity} কেজি</td><td>${esc(r.dealerName)}</td><td>${esc(r.union)}</td><td>${dashIfEmpty(r.landArea)}</td><td>${dashIfEmpty(r.mouza)}</td><td>${dashIfEmpty(r.dagNumber)}</td><td>${dashIfEmpty(r.khatianNumber)}</td><td>${dashIfEmpty(r.cropName)}</td><td>${formatDate(r.date)}</td></tr>`).join('')}</tbody></table>` : emptyState('কোনো রেকর্ড পাওয়া যায়নি।')}
+      ${!distPage.loading && !distPage.error ? renderDistPaginationBar() : ''}
     </div>
   `;
 }
@@ -1775,9 +1934,26 @@ function downloadCSV(filename, csvContent) {
   document.body.appendChild(a); a.click(); document.body.removeChild(a);
   URL.revokeObjectURL(url);
 }
-function exportDistributionsCSV() {
-  const rows = applyCommonFilters(state.distributions).map(r => [r.farmerName, r.nid, r.mobile, fertilizerLabel(r.fertilizer), r.quantity, r.dealerName, r.union, r.village || '-', r.landArea ?? '-', r.mouza || '-', r.dagNumber || '-', r.khatianNumber || '-', r.cropName || '-', r.date]);
-  downloadCSV('distributions.csv', toCSV(['কৃষক', 'এনআইডি', 'মোবাইল', 'সার', 'পরিমাণ(কেজি)', 'ডিলার', 'ইউনিয়ন', 'গ্রাম', 'জমি(শতাংশ)', 'মৌজা', 'দাগ নম্বর', 'খতিয়ান', 'ফসল', 'তারিখ'], rows));
+async function exportDistributionsCSV() {
+  // Large-export path (spec #7): reads from Firebase in 2000-row batches via
+  // query()+limitToFirst — never pulls the whole 70K/100K+ table into the
+  // browser at once, even for a full unfiltered export. NID is guarded
+  // against Excel scientific-notation corruption (spec #6).
+  const btn = document.querySelector('[data-action="export-distributions"]');
+  const origText = btn ? btn.textContent : '';
+  if (btn) { btn.disabled = true; btn.textContent = 'এক্সপোর্ট হচ্ছে... (0)'; }
+  try {
+    const all = await fetchAllDistributionsForExport(state.filters, (count) => {
+      if (btn) btn.textContent = `এক্সপোর্ট হচ্ছে... (${count})`;
+    });
+    const rows = all.map(r => [r.farmerName, csvTextGuard(r.nid), r.mobile, fertilizerLabel(r.fertilizer), r.quantity, r.dealerName, r.union, r.village || '-', r.landArea ?? '-', r.mouza || '-', r.dagNumber || '-', r.khatianNumber || '-', r.cropName || '-', r.date]);
+    downloadCSV('distributions.csv', toCSV(['কৃষক', 'এনআইডি', 'মোবাইল', 'সার', 'পরিমাণ(কেজি)', 'ডিলার', 'ইউনিয়ন', 'গ্রাম', 'জমি(শতাংশ)', 'মৌজা', 'দাগ নম্বর', 'খতিয়ান', 'ফসল', 'তারিখ'], rows));
+    showToast(`${all.length} টি রেকর্ড এক্সপোর্ট সম্পন্ন হয়েছে`, 'success');
+  } catch (e) {
+    showToast('এক্সপোর্ট ব্যর্থ হয়েছে: ' + ((e && e.message) || ''), 'error');
+  } finally {
+    if (btn) { btn.disabled = false; btn.textContent = origText; }
+  }
 }
 function exportDealersCSV() {
   const rows = state.dealers.map(d => [d.name, d.mobile, d.email, d.union, d.area, d.status === 'inactive' ? 'নিষ্ক্রিয়' : 'সক্রিয়']);
@@ -1823,7 +1999,10 @@ document.getElementById('mainApp').addEventListener('click', async (e) => {
     case 'set-log-filter': state.logFilter = target.dataset.type; renderCurrentView(); break;
     case 'export-logs': exportLogsCSV(); break;
     case 'retry-load': await loadAllData(); break;
-    case 'export-distributions': exportDistributionsCSV(); break;
+    case 'dist-next-page': await fetchDistPage('next'); break;
+    case 'dist-prev-page': await fetchDistPage('prev'); break;
+    case 'dist-retry': await fetchDistPage('first'); break;
+    case 'export-distributions': await exportDistributionsCSV(); break;
     case 'export-dealers': exportDealersCSV(); break;
     case 'export-duplicates': exportDuplicatesCSV(); break;
     case 'export-report': exportReportCSV(); break;
@@ -1850,7 +2029,11 @@ document.getElementById('mainApp').addEventListener('submit', async (e) => {
 document.getElementById('mainApp').addEventListener('change', (e) => {
   if (e.target.dataset && e.target.dataset.filter) {
     state.filters[e.target.dataset.filter] = e.target.value;
-    renderCurrentView();
+    if (currentView === 'distributions' || currentView === 'history') {
+      resetAndLoadDistPage(); // filter changed → fresh server-side query, not a client-side re-slice
+    } else {
+      renderCurrentView();
+    }
     return;
   }
   if (e.target.dataset && e.target.dataset.fieldToggle) {
