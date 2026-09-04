@@ -1,4 +1,4 @@
-<!DOCTYPE html>
+  <!DOCTYPE html>
 <html lang="bn">
 <head>
 <meta charset="UTF-8">
@@ -325,8 +325,8 @@ import {
   EmailAuthProvider, reauthenticateWithCredential, updatePassword
 } from "https://www.gstatic.com/firebasejs/10.12.2/firebase-auth.js";
 import {
-  getDatabase, ref, get, set, update, push, remove,
-  query, orderByChild, equalTo, limitToFirst, limitToLast,
+  getDatabase, ref, get, set, update, push, remove, runTransaction,
+  query, orderByChild, orderByKey, equalTo, limitToFirst, limitToLast,
   startAt, startAfter, endAt, endBefore
 } from "https://www.gstatic.com/firebasejs/10.12.2/firebase-database.js";
 import { getAnalytics, isSupported as analyticsIsSupported } from "https://www.gstatic.com/firebasejs/10.12.2/firebase-analytics.js";
@@ -374,6 +374,7 @@ const SESSION_TIMEOUT_MS = 15 * 60 * 1000;
 
 const CROPS = ['ভুট্টা', 'মরিচ', 'সরিষা', 'আলু', 'পেয়াজ', 'রসুন', 'বোরো', 'নিজে লিখুন'];
 const CROP_CUSTOM_VALUE = 'নিজে লিখুন';
+const MAX_CROP_SELECTIONS = 5;
 
 // Fields whose Required/Optional state the Main Admin can configure at
 // runtime (stored at settings/formFields in the DB). Everything else
@@ -408,6 +409,8 @@ const state = {
   reportType: 'union',
   logFilter: 'all',
   farmerSearchResults: null,
+  dashboardStats: null,
+  dealerStats: null,
 };
 /* ---------------- distribution-history pagination state ----------------
    Distribution History (admin/UNO) and Dealer History no longer read from
@@ -446,7 +449,7 @@ function reqAttr(key) {
 }
 function objToArray(obj) {
   if (!obj) return [];
-  return Object.entries(obj).map(([id, val]) => ({ id, ...val }));
+  return Object.entries(obj).map(([firebaseKey, val]) => ({ ...(val || {}), id: firebaseKey, firebaseKey }));
 }
 function formatDate(d) {
   if (!d) return '-';
@@ -463,6 +466,10 @@ function monthKey(dateStr) {
 function fertilizerLabel(v) {
   const f = FERTILIZERS.find(x => x.v === v);
   return f ? f.l : v;
+}
+function cropLabel(record) {
+  const crops = Array.isArray(record.cropNames) ? record.cropNames : (Array.isArray(record.cropName) ? record.cropName : null);
+  return crops ? crops.join(', ') : (record.cropName || '');
 }
 function showToast(msg, type) {
   type = type || 'info';
@@ -491,6 +498,107 @@ async function dbUpdate(path, data) {
 async function dbSet(path, data) {
   await set(ref(db, path), data);
   return true;
+}
+
+function emptyDashboardStats() {
+  const fertilizer = {}; FERTILIZERS.forEach(f => fertilizer[f.v] = 0);
+  const unions = {}; UNIONS.forEach(u => unions[u] = 0);
+  return { totalFarmers: 0, totalDistributions: 0, totalFertilizer: 0, duplicateAttempts: 0, fertilizer, unions, monthly: {}, dealers: {}, dealerStats: {} };
+}
+function mergeDashboardStats(raw) {
+  const base = emptyDashboardStats();
+  return {
+    ...base, ...(raw || {}),
+    fertilizer: { ...base.fertilizer, ...((raw && raw.fertilizer) || {}) },
+    unions: { ...base.unions, ...((raw && raw.unions) || {}) },
+    monthly: { ...((raw && raw.monthly) || {}) },
+    dealers: { ...((raw && raw.dealers) || {}) },
+    dealerStats: { ...((raw && raw.dealerStats) || {}) },
+  };
+}
+async function loadDashboardStats() {
+  const raw = await dbGet('dashboardStats');
+  state.dashboardStats = mergeDashboardStats(raw);
+  if (state.user && state.user.role === 'admin') rebuildDashboardStatsInBackground();
+}
+async function rebuildDashboardStatsInBackground() {
+  if (state.dashboardStatsRebuilding) return;
+  state.dashboardStatsRebuilding = true;
+  const stats = emptyDashboardStats();
+  const farmers = new Set();
+  const base = ref(db, 'distributions');
+  let cursor = null;
+  try {
+    for (let page = 0; page < 500; page++) {
+      const q = cursor
+        ? query(base, orderByKey(), startAfter(cursor.key), limitToFirst(2000))
+        : query(base, orderByKey(), limitToFirst(2000));
+      const snap = await get(q);
+      const rows = objToArray(snap.exists() ? snap.val() : null);
+      if (!rows.length) break;
+      rows.forEach(r => {
+        if (r.nid) farmers.add(r.nid);
+        stats.totalDistributions++;
+        stats.totalFertilizer += parseFloat(r.quantity) || 0;
+        stats.fertilizer[r.fertilizer] = (stats.fertilizer[r.fertilizer] || 0) + (parseFloat(r.quantity) || 0);
+        stats.unions[r.union] = (stats.unions[r.union] || 0) + (parseFloat(r.quantity) || 0);
+        stats.dealers[r.dealerId] = (stats.dealers[r.dealerId] || 0) + 1;
+        if (!stats.dealerStats[r.dealerId]) stats.dealerStats[r.dealerId] = { totalDistributions: 0, totalFertilizer: 0, farmers: {} };
+        stats.dealerStats[r.dealerId].totalDistributions++;
+        stats.dealerStats[r.dealerId].totalFertilizer += parseFloat(r.quantity) || 0;
+        if (r.nid) stats.dealerStats[r.dealerId].farmers[r.nid] = true;
+        const key = monthKey(r.date); if (key) stats.monthly[key] = (stats.monthly[key] || 0) + (parseFloat(r.quantity) || 0);
+      });
+      const last = rows[rows.length - 1];
+      cursor = { key: last.firebaseKey };
+      if (rows.length < 2000) break;
+    }
+    stats.totalFarmers = farmers.size;
+    const duplicates = await dbGet('duplicateAttempts');
+    stats.duplicateAttempts = Object.keys(duplicates || {}).length;
+    await dbSet('dashboardStats', stats);
+    state.dashboardStats = stats;
+    if (state.user && currentView === 'dashboard') { renderCurrentView(); initDashboardCharts(); }
+  } catch (e) {
+    // Dashboard remains usable with the last lightweight snapshot.
+  } finally { state.dashboardStatsRebuilding = false; }
+}
+async function updateDashboardStatsForRecord(record) {
+  try {
+    const key = monthKey(record.date);
+    const updates = {
+      totalDistributions: (state.dashboardStats?.totalDistributions || 0) + 1,
+      totalFertilizer: (state.dashboardStats?.totalFertilizer || 0) + (parseFloat(record.quantity) || 0),
+    };
+    await dbUpdate('dashboardStats', updates);
+    await runTransaction(ref(db, `dashboardStats/fertilizer/${record.fertilizer}`), value => (Number(value) || 0) + (parseFloat(record.quantity) || 0));
+    await runTransaction(ref(db, `dashboardStats/unions/${record.union}`), value => (Number(value) || 0) + (parseFloat(record.quantity) || 0));
+    if (key) await runTransaction(ref(db, `dashboardStats/monthly/${key}`), value => (Number(value) || 0) + (parseFloat(record.quantity) || 0));
+    await runTransaction(ref(db, `dashboardStats/dealers/${record.dealerId}`), value => (Number(value) || 0) + 1);
+    await runTransaction(ref(db, `dashboardStats/dealerStats/${record.dealerId}/totalDistributions`), value => (Number(value) || 0) + 1);
+    await runTransaction(ref(db, `dashboardStats/dealerStats/${record.dealerId}/totalFertilizer`), value => (Number(value) || 0) + (parseFloat(record.quantity) || 0));
+    if (record.nid) await dbSet(`dashboardStats/dealerStats/${record.dealerId}/farmers/${record.nid}`, true);
+  } catch (e) { /* Statistics must never block a successful distribution. */ }
+}
+function applyLocalDashboardStats(records) {
+  const stats = mergeDashboardStats(state.dashboardStats);
+  records.forEach(record => {
+    const quantity = parseFloat(record.quantity) || 0;
+    stats.totalDistributions++;
+    stats.totalFertilizer += quantity;
+    stats.fertilizer[record.fertilizer] = (stats.fertilizer[record.fertilizer] || 0) + quantity;
+    stats.unions[record.union] = (stats.unions[record.union] || 0) + quantity;
+    stats.dealers[record.dealerId] = (stats.dealers[record.dealerId] || 0) + 1;
+    const key = monthKey(record.date);
+    if (key) stats.monthly[key] = (stats.monthly[key] || 0) + quantity;
+    const dealer = stats.dealerStats[record.dealerId] || { totalDistributions: 0, totalFertilizer: 0, farmers: {} };
+    dealer.totalDistributions++;
+    dealer.totalFertilizer += quantity;
+    if (record.nid) dealer.farmers[record.nid] = true;
+    stats.dealerStats[record.dealerId] = dealer;
+  });
+  stats.totalFarmers = new Set(Object.values(stats.dealerStats).flatMap(d => Object.keys(d.farmers || {}))).size;
+  state.dashboardStats = stats;
 }
 
 /* =========================================================================
@@ -528,9 +636,10 @@ async function runDistIndexedQuery(idx, filters, direction, cursor) {
   const base = ref(db, 'distributions');
   let q;
   if (!idx.field) {
-    // No filter at all → newest-first via limitToLast, older pages via endBefore cursor.
-    if (direction === 'first') q = query(base, orderByChild('date'), limitToLast(PAGE_SIZE));
-    else q = query(base, orderByChild('date'), endBefore(cursor.date, cursor.key), limitToLast(PAGE_SIZE));
+    // No filter at all: paginate by the immutable Firebase child key so no
+    // record is skipped when legacy rows have duplicate or missing dates.
+    if (direction === 'first') q = query(base, orderByKey(), limitToFirst(PAGE_SIZE));
+    else q = query(base, orderByKey(), startAfter(cursor.key), limitToFirst(PAGE_SIZE));
   } else if (idx.field === 'date') {
     const endBound = (filters.dateTo || '') + '\uf8ff';
     if (direction === 'first') q = query(base, orderByChild('date'), startAt(filters.dateFrom || ''), endAt(endBound), limitToFirst(PAGE_SIZE));
@@ -541,8 +650,9 @@ async function runDistIndexedQuery(idx, filters, direction, cursor) {
   }
   const snap = await get(q);
   const rows = objToArray(snap.exists() ? snap.val() : null);
+  const lastRawRow = rows[rows.length - 1] || null;
   rows.sort((a, b) => new Date(b.date) - new Date(a.date));
-  return rows;
+  return { rows, cursor: lastRawRow ? { date: lastRawRow.date || '', key: lastRawRow.firebaseKey } : null };
 }
 async function fetchDistPage(direction) {
   distPage.loading = true; distPage.error = null;
@@ -552,18 +662,23 @@ async function fetchDistPage(direction) {
     const filters = forDealer ? { ...state.filters, _dealerUid: state.user.id, dealer: '' } : state.filters;
     const idx = distIndexField(filters, forDealer);
     let cursor = null;
-    if (direction === 'next') cursor = distPage.cursorStack[distPage.pageNumber];
-    if (direction === 'prev') cursor = distPage.cursorStack[distPage.pageNumber - 2] || null;
-    const effDirection = (direction === 'first' || (direction === 'prev' && !cursor)) ? 'first' : direction;
-    const rawRows = await runDistIndexedQuery(idx, filters, effDirection, cursor);
+    let effDirection = direction;
+    if (direction === 'next') cursor = distPage.cursorStack[distPage.pageNumber] || null;
+    if (direction === 'prev') {
+      const targetPage = Math.max(1, distPage.pageNumber - 1);
+      if (targetPage === 1) effDirection = 'first';
+      else { effDirection = 'next'; cursor = distPage.cursorStack[targetPage - 1] || null; }
+    }
+    if (direction === 'first') effDirection = 'first';
+    const pageResult = await runDistIndexedQuery(idx, filters, effDirection, cursor);
+    const rawRows = pageResult.rows;
 
     if (direction === 'first') { distPage.pageNumber = 1; distPage.cursorStack = [null]; }
     else if (direction === 'next') { distPage.pageNumber += 1; }
     else { distPage.pageNumber = Math.max(1, distPage.pageNumber - 1); }
 
-    if (rawRows.length) {
-      const last = rawRows[rawRows.length - 1];
-      distPage.cursorStack[distPage.pageNumber] = { date: last.date, key: last.id };
+    if (pageResult.cursor) {
+      distPage.cursorStack[distPage.pageNumber] = pageResult.cursor;
     }
     distPage.hasNext = rawRows.length === PAGE_SIZE;
     distPage.rows = remainingClientFilters(rawRows, filters, idx.field);
@@ -596,8 +711,8 @@ async function fetchAllDistributionsForExport(filters, onProgress) {
   while (more) {
     let q;
     if (!idx.field) {
-      q = cursorKey ? query(base, orderByChild('date'), startAfter(lastDate, cursorKey), limitToFirst(BATCH))
-                    : query(base, orderByChild('date'), limitToFirst(BATCH));
+      q = cursorKey ? query(base, orderByKey(), startAfter(cursorKey), limitToFirst(BATCH))
+                    : query(base, orderByKey(), limitToFirst(BATCH));
     } else if (idx.field === 'date') {
       const endBound = (effFilters.dateTo || '') + '\uf8ff';
       q = cursorKey ? query(base, orderByChild('date'), startAfter(lastDate, cursorKey), endAt(endBound), limitToFirst(BATCH))
@@ -611,7 +726,7 @@ async function fetchAllDistributionsForExport(filters, onProgress) {
     all = all.concat(remainingClientFilters(batch, effFilters, idx.field));
     if (onProgress) onProgress(all.length);
     if (batch.length < BATCH) { more = false; }
-    else { const last = batch[batch.length - 1]; cursorKey = last.id; lastDate = last.date; }
+    else { const last = batch[batch.length - 1]; cursorKey = last.firebaseKey; lastDate = last.date; }
     if (++safety > 500) break; // hard safety cap — covers up to ~1M rows
   }
   all.sort((a, b) => new Date(b.date) - new Date(a.date));
@@ -689,45 +804,40 @@ async function loadSystemLogsOnly() {
   }
   renderCurrentView();
 }
+async function loadFormFieldsOnly() {
+  try {
+    const formFieldsObj = await dbGet('settings/formFields');
+    state.formFieldSettings = { ...DEFAULT_FORM_FIELD_SETTINGS, ...(formFieldsObj || {}) };
+    if (state.user && currentView === 'dashboard') renderCurrentView();
+  } catch (e) { /* Optional configuration must not block the shell. */ }
+}
+async function loadDuplicatesOnly() {
+  try {
+    const dupObj = await dbGet('duplicateAttempts');
+    state.duplicates = objToArray(dupObj).sort((a, b) => (b.createdAt || 0) - (a.createdAt || 0));
+    renderCurrentView();
+  } catch (e) { state.duplicates = []; }
+}
 async function loadAllData() {
   state.loading = true; state.dbError = null; renderCurrentView();
   try {
-    // Form-field Required/Optional configuration is needed by every role
-    // (dealers need it to render the distribution form correctly), so it's
-    // always loaded regardless of role.
-    const formFieldsObj = await dbGet('settings/formFields');
-    state.formFieldSettings = { ...DEFAULT_FORM_FIELD_SETTINGS, ...(formFieldsObj || {}) };
-
     if (state.user.role === 'admin' || state.user.role === 'uno') {
-      // Main Admin AND UNO have identical data-read access (see the Security
-      // Rules block) — loads everything critical to the dashboard first.
-      const [dealersObj, distObj, dupObj] = await Promise.all([dbGet('dealers'), dbGet('distributions'), dbGet('duplicateAttempts')]);
+      // Dashboard-critical reads only. History, reports, search and duplicate
+      // logs load their own data when those views are opened.
+      const [dealersObj] = await Promise.all([dbGet('dealers'), loadDashboardStats()]);
       state.dealers = objToArray(dealersObj);
-      state.distributions = objToArray(distObj).sort((a, b) => new Date(b.date) - new Date(a.date));
-      state.duplicates = objToArray(dupObj).sort((a, b) => (b.createdAt || 0) - (a.createdAt || 0));
+      state.distributions = [];
+      state.duplicates = [];
       state.unos = [];
       state.systemLogs = [];
       if (state.user.role === 'admin') {
-        // uno/systemLogs are Main-Admin-exclusive and loaded SEPARATELY on
-        // purpose: if their Security Rules aren't set up correctly yet (a
-        // common setup step people forget), that failure must not take down
-        // the rest of the admin dashboard — it only affects these two.
-        try {
-          const unoObj = await dbGet('uno');
-          state.unos = objToArray(unoObj);
-        } catch (e) { state.unos = []; }
-        await loadSystemLogsOnly();
+        dbGet('uno').then(unoObj => { state.unos = objToArray(unoObj); }).catch(() => { state.unos = []; });
+        setTimeout(() => loadSystemLogsOnly(), 0);
       }
     } else {
-      // Any signed-in dealer can READ the shared distributions/duplicateAttempts
-      // logs (needed for cross-dealer duplicate detection & farmer search),
-      // but the Security Rules only ever let a dealer WRITE a record whose
-      // dealerId equals their own UID, and only while their profile status
-      // is "active" — so read access here does not translate into write access.
-      const [distObj, dupObj] = await Promise.all([dbGet('distributions'), dbGet('duplicateAttempts')]);
+      await loadDashboardStats();
       state.dealers = []; state.unos = []; state.systemLogs = [];
-      state.distributions = objToArray(distObj).sort((a, b) => new Date(b.date) - new Date(a.date));
-      state.duplicates = objToArray(dupObj).sort((a, b) => (b.createdAt || 0) - (a.createdAt || 0));
+      state.distributions = []; state.duplicates = [];
     }
     state.dbError = null;
   } catch (e) {
@@ -735,6 +845,7 @@ async function loadAllData() {
   }
   state.loading = false;
   renderShell();
+  loadFormFieldsOnly();
 }
 
 /* ---------------- auth (Firebase Authentication) ---------------- */
@@ -903,11 +1014,24 @@ function navigateTo(view) {
   renderSidebar();
   if (view === 'distributions' || view === 'history') {
     resetAndLoadDistPage(); // server-side paginated fetch (500/page), independent of state.distributions
+  } else if (view === 'duplicates') {
+    renderCurrentView();
+    loadDuplicatesOnly();
+  } else if (view === 'reports' || view === 'farmerSearch') {
+    renderCurrentView();
+    loadDistributionsForAnalysis();
   } else {
     renderCurrentView();
   }
   closeMobileSidebar();
   document.getElementById('mainContent').scrollTop = 0;
+}
+async function loadDistributionsForAnalysis() {
+  try {
+    const rows = await fetchAllDistributionsForExport({ union: '', dealer: '', fertilizer: '', dateFrom: '', dateTo: '' });
+    state.distributions = rows;
+    if (state.user && (currentView === 'reports' || currentView === 'farmerSearch')) renderCurrentView();
+  } catch (e) { showToast('বিশ্লেষণ ডেটা লোড করা যায়নি', 'error'); }
 }
 function toggleMobileSidebar() {
   document.getElementById('sidebar').classList.toggle('open');
@@ -979,11 +1103,12 @@ function emptyState(text) { return `<div class="empty-state">${ic('empty', 'icon
 
 /* ---------------- admin dashboard ---------------- */
 function renderAdminDashboard() {
+  const stats = mergeDashboardStats(state.dashboardStats);
   const totalDealers = state.dealers.length;
-  const totalFarmers = new Set(state.distributions.map(d => d.nid)).size;
-  const totalDistributions = state.distributions.length;
-  const duplicateAttempts = state.duplicates.length;
-  const totalFertilizer = state.distributions.reduce((s, d) => s + (parseFloat(d.quantity) || 0), 0);
+  const totalFarmers = stats.totalFarmers;
+  const totalDistributions = stats.totalDistributions;
+  const duplicateAttempts = stats.duplicateAttempts;
+  const totalFertilizer = stats.totalFertilizer;
   return `
     <div class="page-header"><h2>ড্যাশবোর্ড</h2><span class="muted">সিস্টেমের সার্বিক অবস্থা</span></div>
     <div class="stat-grid">
@@ -1002,8 +1127,7 @@ function renderAdminDashboard() {
   `;
 }
 function renderTopDealers() {
-  const counts = {};
-  state.distributions.forEach(d => { counts[d.dealerId] = (counts[d.dealerId] || 0) + 1; });
+  const counts = (state.dashboardStats && state.dashboardStats.dealers) || {};
   const ranked = state.dealers.map(d => ({ ...d, count: counts[d.id] || 0 })).sort((a, b) => b.count - a.count).slice(0, 5);
   if (!ranked.length) return `<p class="muted">এখনো কোনো ডিলার নেই।</p>`;
   return ranked.map((d, i) => `
@@ -1061,17 +1185,15 @@ async function initDashboardCharts() {
       return;
     }
   }
-  if (!state.distributions.length) {
+  const stats = mergeDashboardStats(state.dashboardStats);
+  if (!stats.totalDistributions) {
     CHART_IDS.forEach(id => showChartMessage(id, 'এখনো কোনো বিতরণ তথ্য নেই।', false, false));
     return;
   }
 
-  const fertTotals = {}; FERTILIZERS.forEach(f => fertTotals[f.v] = 0);
-  state.distributions.forEach(d => { fertTotals[d.fertilizer] = (fertTotals[d.fertilizer] || 0) + (parseFloat(d.quantity) || 0); });
-  const unionTotals = {}; UNIONS.forEach(u => unionTotals[u] = 0);
-  state.distributions.forEach(d => { unionTotals[d.union] = (unionTotals[d.union] || 0) + (parseFloat(d.quantity) || 0); });
-  const monthlyMap = {};
-  state.distributions.forEach(d => { const k = monthKey(d.date); if (!k) return; monthlyMap[k] = (monthlyMap[k] || 0) + (parseFloat(d.quantity) || 0); });
+  const fertTotals = stats.fertilizer;
+  const unionTotals = stats.unions;
+  const monthlyMap = stats.monthly;
   const monthKeys = Object.keys(monthlyMap).sort().slice(-6);
 
   try {
@@ -1428,10 +1550,14 @@ function renderDistributionForm() {
         </div>
         <div class="field">
           <label>ফসলের নাম${reqMark('cropName')}</label>
-          <select name="cropName" ${reqAttr('cropName')}>
-            <option value="">-- নির্বাচন করুন --</option>
-            ${CROPS.map(c => `<option value="${esc(c)}">${esc(c)}</option>`).join('')}
-          </select>
+          <p class="muted" style="margin-top:-4px;margin-bottom:10px;">প্রয়োজনে সর্বোচ্চ ${MAX_CROP_SELECTIONS}টি ফসল একে একে যোগ করুন।</p>
+          <div id="cropRows">
+            <div class="crop-row form-grid cols-2" style="margin-bottom:10px;">
+              <div class="field" style="margin-bottom:0;"><label>ফসল</label><select name="cropName[]" ${reqAttr('cropName')}><option value="">-- নির্বাচন করুন --</option>${CROPS.map(c => `<option value="${esc(c)}">${esc(c)}</option>`).join('')}</select></div>
+              <div class="field" style="margin-bottom:0;display:flex;align-items:flex-end;"><button type="button" class="btn btn-outline btn-sm" data-action="remove-crop-row" style="display:none;">✕</button></div>
+            </div>
+          </div>
+          <button type="button" class="btn btn-outline btn-sm" data-action="add-crop-row">+ আরেকটি ফসল যোগ করুন</button>
         </div>
         <div class="field" id="cropCustomField" style="display:none;">
           <label>ফসলের নাম লিখুন</label>
@@ -1457,6 +1583,34 @@ function renderDistributionForm() {
       </form>
     </div>
   `;
+}
+function cropRowTemplate() {
+  return `<div class="field" style="margin-bottom:0;"><label>ফসল</label><select name="cropName[]" ${reqAttr('cropName')}><option value="">-- নির্বাচন করুন --</option>${CROPS.map(c => `<option value="${esc(c)}">${esc(c)}</option>`).join('')}</select></div><div class="field" style="margin-bottom:0;display:flex;align-items:flex-end;"><button type="button" class="btn btn-outline btn-sm" data-action="remove-crop-row">✕</button></div>`;
+}
+function addCropRow() {
+  const container = document.getElementById('cropRows');
+  if (!container) return;
+  const rows = container.querySelectorAll('.crop-row');
+  if (rows.length >= MAX_CROP_SELECTIONS) { showToast(`সর্বোচ্চ ${MAX_CROP_SELECTIONS} টি ফসল একসাথে যোগ করা যাবে`, 'error'); return; }
+  const row = document.createElement('div');
+  row.className = 'crop-row form-grid cols-2';
+  row.style.marginBottom = '10px';
+  row.innerHTML = cropRowTemplate();
+  container.appendChild(row);
+  updateCropRowRemoveButtons();
+}
+function removeCropRow(target) {
+  const container = document.getElementById('cropRows');
+  const row = target.closest('.crop-row');
+  if (!row || !container || container.querySelectorAll('.crop-row').length <= 1) return;
+  row.remove();
+  updateCropRowRemoveButtons();
+}
+function updateCropRowRemoveButtons() {
+  const container = document.getElementById('cropRows');
+  if (!container) return;
+  const rows = container.querySelectorAll('.crop-row');
+  rows.forEach(row => { const btn = row.querySelector('[data-action="remove-crop-row"]'); if (btn) btn.style.display = rows.length > 1 ? '' : 'none'; });
 }
 function fertRowTemplate() {
   return `
@@ -1505,15 +1659,22 @@ function hideDuplicateWarning() {
   const el = document.getElementById('distDuplicateWarning');
   if (el) { el.style.display = 'none'; el.innerHTML = ''; }
 }
-function findDuplicate(nid, fertilizer, dateStr) {
+async function findDuplicatesForNid(nid) {
+  const q = query(ref(db, 'distributions'), orderByChild('nid'), equalTo(nid));
+  const snap = await get(q);
+  return objToArray(snap.exists() ? snap.val() : null);
+}
+function findDuplicate(rows, nid, fertilizer, dateStr) {
   const mk = monthKey(dateStr);
-  return state.distributions.find(r => r.nid === nid && r.fertilizer === fertilizer && monthKey(r.date) === mk);
+  return rows.find(r => r.nid === nid && r.fertilizer === fertilizer && monthKey(r.date) === mk);
 }
 async function handleDistributionSubmit(form) {
   if (isSubmitting) return;
   hideDuplicateWarning();
-  const cropSelect = form.cropName.value;
+  const cropSelections = [...form.querySelectorAll('select[name="cropName[]"]')].map(select => select.value).filter(Boolean);
   const cropCustom = form.cropNameCustom ? form.cropNameCustom.value.trim() : '';
+  const cropNames = cropSelections.filter(c => c !== CROP_CUSTOM_VALUE);
+  if (cropSelections.includes(CROP_CUSTOM_VALUE) && cropCustom) cropNames.push(cropCustom);
   const landAreaRaw = form.landArea.value;
   const landArea = landAreaRaw ? parseFloat(landAreaRaw) : null;
   const data = {
@@ -1526,7 +1687,8 @@ async function handleDistributionSubmit(form) {
     mouza: form.mouza.value.trim(),
     dagNumber: form.dagNumber.value.trim(),
     khatianNumber: form.khatianNumber.value.trim(),
-    cropName: cropSelect === CROP_CUSTOM_VALUE ? cropCustom : cropSelect,
+    cropName: cropNames.join(', '),
+    cropNames,
     date: form.date.value,
     remarks: form.remarks.value.trim(),
   };
@@ -1539,8 +1701,8 @@ async function handleDistributionSubmit(form) {
   if (isFieldRequired('mouza') && !data.mouza) { showToast('মৌজা নাম দিন', 'error'); return; }
   if (isFieldRequired('dagNumber') && !data.dagNumber) { showToast('জমি দাগ নম্বর দিন', 'error'); return; }
   if (isFieldRequired('khatianNumber') && !data.khatianNumber) { showToast('খতিয়ান নং দিন', 'error'); return; }
-  if (isFieldRequired('cropName') && !cropSelect) { showToast('ফসলের নাম নির্বাচন করুন', 'error'); return; }
-  if (cropSelect === CROP_CUSTOM_VALUE && !cropCustom) { showToast('ফসলের নাম লিখে দিন', 'error'); return; }
+  if (isFieldRequired('cropName') && !cropNames.length) { showToast('ফসলের নাম নির্বাচন করুন', 'error'); return; }
+  if (cropSelections.includes(CROP_CUSTOM_VALUE) && !cropCustom) { showToast('ফসলের নাম লিখে দিন', 'error'); return; }
   if (new Date(data.date) > new Date()) { showToast('ভবিষ্যতের তারিখ দেওয়া যাবে না', 'error'); return; }
 
   // Collect every fertilizer row the dealer added (one farmer visit can now
@@ -1557,11 +1719,22 @@ async function handleDistributionSubmit(form) {
   if (new Set(items.map(i => i.fertilizer)).size !== items.length) {
     showToast('একই সার একাধিকবার নির্বাচন করা যাবে না', 'error'); return;
   }
+  if (new Set(cropNames).size !== cropNames.length) {
+    showToast('একই ফসল একাধিকবার নির্বাচন করা যাবে না', 'error'); return;
+  }
 
   // dealerId/dealerName ALWAYS come from the authenticated Firebase user —
   // never from anything typed into this form. Duplicate detection still
   // runs per-fertilizer, exactly as before — just once per row now.
-  const dupItems = items.map(it => ({ ...it, dup: findDuplicate(data.nid, it.fertilizer, data.date) })).filter(x => x.dup);
+  let existingRows = [];
+  try {
+    existingRows = await findDuplicatesForNid(data.nid);
+  } catch (e) {
+    // Older Firebase rules may not have a nid index yet; preserve duplicate
+    // protection by using the legacy read only at submit time.
+    try { existingRows = objToArray(await dbGet('distributions')); } catch (ignored) { existingRows = []; }
+  }
+  const dupItems = items.map(it => ({ ...it, dup: findDuplicate(existingRows, data.nid, it.fertilizer, data.date) })).filter(x => x.dup);
   if (dupItems.length) {
     for (const di of dupItems) {
       try {
@@ -1592,6 +1765,8 @@ async function handleDistributionSubmit(form) {
       newRecords.push({ id: res.name, ...record });
     }
     state.distributions.unshift(...newRecords);
+    applyLocalDashboardStats(newRecords);
+    if (state.user.role === 'admin') rebuildDashboardStatsInBackground();
     showToast(`সফলভাবে সংরক্ষণ করা হয়েছে (${items.length} টি সার)`, 'success');
     writeSystemLog('data_entry', 'distribution_created', `কৃষক: ${data.farmerName} | ${items.length} টি সার (${items.map(i => i.fertilizer).join(', ')})`);
     renderCurrentView();
@@ -1605,16 +1780,18 @@ async function handleDistributionSubmit(form) {
 
 /* ---------------- dealer dashboard / history / profile ---------------- */
 function renderDealerDashboard() {
+  const dealerStats = (state.dashboardStats && state.dashboardStats.dealerStats && state.dashboardStats.dealerStats[state.user.id]) || {};
   const mine = state.distributions.filter(d => d.dealerId === state.user.id);
   const today = todayStr();
   const todayCount = mine.filter(d => d.date === today).length;
   const myDuplicates = state.duplicates.filter(d => d.dealerId === state.user.id).length;
-  const farmers = new Set(mine.map(d => d.nid)).size;
+  const farmers = Object.keys(dealerStats.farmers || {}).length || new Set(mine.map(d => d.nid)).size;
+  const totalDistributions = dealerStats.totalDistributions || mine.length;
   return `
     <div class="page-header"><h2>স্বাগতম, ${esc(state.user.name)}</h2><span class="muted">${esc(state.user.union)}</span></div>
     <div class="stat-grid">
       ${statCard('আজকের বিতরণ', todayCount, 'distribute')}
-      ${statCard('সর্বমোট বিতরণ', mine.length, 'history')}
+      ${statCard('সর্বমোট বিতরণ', totalDistributions, 'history')}
       ${statCard('ডুপ্লিকেট চেষ্টা', myDuplicates, 'duplicate', 'danger')}
       ${statCard('নিবন্ধিত কৃষক', farmers, 'profile')}
     </div>
@@ -1625,15 +1802,37 @@ function renderDealerDashboard() {
   `;
 }
 function renderDistPaginationBar() {
+  const dealerTotal = state.user && state.user.role === 'dealer'
+    ? Number(state.dashboardStats && state.dashboardStats.dealerStats && state.dashboardStats.dealerStats[state.user.id] && state.dashboardStats.dealerStats[state.user.id].totalDistributions)
+    : 0;
+  const total = dealerTotal || Number((state.dashboardStats && state.dashboardStats.totalDistributions) || 0);
+  const totalPages = total ? Math.ceil(total / PAGE_SIZE) : (distPage.hasNext ? distPage.pageNumber + 1 : distPage.pageNumber);
+  const pageButtons = [];
+  const visiblePages = totalPages <= 100
+    ? Array.from({ length: totalPages }, (_, i) => i + 1)
+    : Array.from(new Set([1, 2, distPage.pageNumber - 1, distPage.pageNumber, distPage.pageNumber + 1, totalPages - 1, totalPages])).filter(page => page >= 1 && page <= totalPages).sort((a, b) => a - b);
+  for (const page of visiblePages) {
+    pageButtons.push(`<button class="btn ${page === distPage.pageNumber ? 'btn-primary' : 'btn-outline'} btn-sm" data-action="dist-page" data-page="${page}" ${distPage.loading ? 'disabled' : ''}>${page}</button>`);
+  }
   return `
     <div class="row-between" style="margin-top:10px;flex-wrap:wrap;gap:8px;">
-      <div class="muted">এই পেজে ${distPage.rows.length} টি রেকর্ড দেখানো হচ্ছে (পেজ প্রতি সর্বোচ্চ ${PAGE_SIZE} টি) — পেজ ${distPage.pageNumber}</div>
+      <div class="muted">এই পেজে ${distPage.rows.length} টি রেকর্ড দেখানো হচ্ছে (প্রতি পেজে ${PAGE_SIZE} টি) — পেজ ${distPage.pageNumber}${totalPages ? ` / ${totalPages}` : ''}</div>
       <div style="display:flex;gap:8px;">
         <button class="btn btn-outline btn-sm" data-action="dist-prev-page" ${distPage.pageNumber <= 1 || distPage.loading ? 'disabled' : ''}>← আগের পেজ</button>
+        <div style="display:flex;gap:4px;">${pageButtons.join('')}</div>
         <button class="btn btn-outline btn-sm" data-action="dist-next-page" ${!distPage.hasNext || distPage.loading ? 'disabled' : ''}>পরের পেজ →</button>
       </div>
     </div>
   `;
+}
+async function goToDistPage(targetPage) {
+  targetPage = Math.max(1, Number(targetPage) || 1);
+  if (targetPage === distPage.pageNumber) return;
+  if (targetPage < distPage.pageNumber) {
+    while (distPage.pageNumber > targetPage) await fetchDistPage('prev');
+    return;
+  }
+  while (distPage.pageNumber < targetPage && distPage.hasNext) await fetchDistPage('next');
 }
 function renderDealerHistory() {
   const rows = distPage.rows;
@@ -1642,7 +1841,7 @@ function renderDealerHistory() {
     ${renderFilterBar({ showDealer: false, showUnion: false })}
     <div class="glass-card" style="margin-bottom:12px;"><span class="muted">আপনার এলাকা: <b>${esc(state.user.union)}</b> — শুধুমাত্র আপনার নিজের বিতরণের রেকর্ড এখানে দেখা যাবে।</span></div>
     <div class="glass-card table-wrap">
-      ${distPage.loading ? `<div class="loading">তথ্য লোড হচ্ছে...</div>` : distPage.error ? `<div class="db-error"><strong>সংযোগ সমস্যা</strong><br>${esc(distPage.error)}<div style="margin-top:12px;"><button class="btn btn-outline btn-sm" data-action="dist-retry">আবার চেষ্টা করুন</button></div></div>` : rows.length ? `<table class="data-table"><thead><tr><th>#</th><th>কৃষক</th><th>এনআইডি</th><th>মোবাইল</th><th>সার</th><th>পরিমাণ</th><th>গ্রাম</th><th>জমি(%)</th><th>মৌজা</th><th>দাগ</th><th>খতিয়ান</th><th>ফসল</th><th>তারিখ</th></tr></thead><tbody>${rows.map((r, i) => `<tr><td>${i + 1}</td><td>${esc(r.farmerName)}</td><td>${esc(r.nid)}</td><td>${esc(r.mobile)}</td><td>${esc(fertilizerLabel(r.fertilizer))}</td><td>${r.quantity} কেজি</td><td>${dashIfEmpty(r.village)}</td><td>${dashIfEmpty(r.landArea)}</td><td>${dashIfEmpty(r.mouza)}</td><td>${dashIfEmpty(r.dagNumber)}</td><td>${dashIfEmpty(r.khatianNumber)}</td><td>${dashIfEmpty(r.cropName)}</td><td>${formatDate(r.date)}</td></tr>`).join('')}</tbody></table>` : emptyState('কোনো রেকর্ড পাওয়া যায়নি।')}
+      ${distPage.loading ? `<div class="loading">তথ্য লোড হচ্ছে...</div>` : distPage.error ? `<div class="db-error"><strong>সংযোগ সমস্যা</strong><br>${esc(distPage.error)}<div style="margin-top:12px;"><button class="btn btn-outline btn-sm" data-action="dist-retry">আবার চেষ্টা করুন</button></div></div>` : rows.length ? `<table class="data-table"><thead><tr><th>#</th><th>কৃষক</th><th>এনআইডি</th><th>মোবাইল</th><th>সার</th><th>পরিমাণ</th><th>গ্রাম</th><th>জমি(%)</th><th>মৌজা</th><th>দাগ</th><th>খতিয়ান</th><th>ফসল</th><th>তারিখ</th></tr></thead><tbody>${rows.map((r, i) => `<tr><td>${i + 1}</td><td>${esc(r.farmerName)}</td><td>${esc(r.nid)}</td><td>${esc(r.mobile)}</td><td>${esc(fertilizerLabel(r.fertilizer))}</td><td>${r.quantity} কেজি</td><td>${dashIfEmpty(r.village)}</td><td>${dashIfEmpty(r.landArea)}</td><td>${dashIfEmpty(r.mouza)}</td><td>${dashIfEmpty(r.dagNumber)}</td><td>${dashIfEmpty(r.khatianNumber)}</td><td>${dashIfEmpty(cropLabel(r))}</td><td>${formatDate(r.date)}</td></tr>`).join('')}</tbody></table>` : emptyState('কোনো রেকর্ড পাওয়া যায়নি।')}
       ${!distPage.loading && !distPage.error ? renderDistPaginationBar() : ''}
     </div>
   `;
@@ -1719,7 +1918,7 @@ function renderDistributionRecords() {
     <div class="page-header"><h2>বিতরণ রেকর্ড</h2><button class="btn btn-outline btn-sm" data-action="export-distributions">${ic('export', 'icon-sm')} CSV এক্সপোর্ট (ফিল্টার অনুযায়ী সব)</button></div>
     ${renderFilterBar()}
     <div class="glass-card table-wrap">
-      ${distPage.loading ? `<div class="loading">তথ্য লোড হচ্ছে...</div>` : distPage.error ? `<div class="db-error"><strong>সংযোগ সমস্যা</strong><br>${esc(distPage.error)}<div style="margin-top:12px;"><button class="btn btn-outline btn-sm" data-action="dist-retry">আবার চেষ্টা করুন</button></div></div>` : rows.length ? `<table class="data-table"><thead><tr><th>#</th><th>কৃষক</th><th>এনআইডি</th><th>মোবাইল</th><th>সার</th><th>পরিমাণ</th><th>ডিলার</th><th>ইউনিয়ন</th><th>জমি(%)</th><th>মৌজা</th><th>দাগ</th><th>খতিয়ান</th><th>ফসল</th><th>তারিখ</th></tr></thead><tbody>${rows.map((r, i) => `<tr><td>${i + 1}</td><td>${esc(r.farmerName)}</td><td>${esc(r.nid)}</td><td>${esc(r.mobile)}</td><td>${esc(fertilizerLabel(r.fertilizer))}</td><td>${r.quantity} কেজি</td><td>${esc(r.dealerName)}</td><td>${esc(r.union)}</td><td>${dashIfEmpty(r.landArea)}</td><td>${dashIfEmpty(r.mouza)}</td><td>${dashIfEmpty(r.dagNumber)}</td><td>${dashIfEmpty(r.khatianNumber)}</td><td>${dashIfEmpty(r.cropName)}</td><td>${formatDate(r.date)}</td></tr>`).join('')}</tbody></table>` : emptyState('কোনো রেকর্ড পাওয়া যায়নি।')}
+      ${distPage.loading ? `<div class="loading">তথ্য লোড হচ্ছে...</div>` : distPage.error ? `<div class="db-error"><strong>সংযোগ সমস্যা</strong><br>${esc(distPage.error)}<div style="margin-top:12px;"><button class="btn btn-outline btn-sm" data-action="dist-retry">আবার চেষ্টা করুন</button></div></div>` : rows.length ? `<table class="data-table"><thead><tr><th>#</th><th>কৃষক</th><th>এনআইডি</th><th>মোবাইল</th><th>সার</th><th>পরিমাণ</th><th>ডিলার</th><th>ইউনিয়ন</th><th>জমি(%)</th><th>মৌজা</th><th>দাগ</th><th>খতিয়ান</th><th>ফসল</th><th>তারিখ</th></tr></thead><tbody>${rows.map((r, i) => `<tr><td>${i + 1}</td><td>${esc(r.farmerName)}</td><td>${esc(r.nid)}</td><td>${esc(r.mobile)}</td><td>${esc(fertilizerLabel(r.fertilizer))}</td><td>${r.quantity} কেজি</td><td>${esc(r.dealerName)}</td><td>${esc(r.union)}</td><td>${dashIfEmpty(r.landArea)}</td><td>${dashIfEmpty(r.mouza)}</td><td>${dashIfEmpty(r.dagNumber)}</td><td>${dashIfEmpty(r.khatianNumber)}</td><td>${dashIfEmpty(cropLabel(r))}</td><td>${formatDate(r.date)}</td></tr>`).join('')}</tbody></table>` : emptyState('কোনো রেকর্ড পাওয়া যায়নি।')}
       ${!distPage.loading && !distPage.error ? renderDistPaginationBar() : ''}
     </div>
   `;
@@ -1751,7 +1950,7 @@ function performFarmerSearch(q) {
         (r.mouza || '').toLowerCase().includes(ql) ||
         (r.dagNumber || '').toLowerCase().includes(ql) ||
         (r.khatianNumber || '').toLowerCase().includes(ql) ||
-        (r.cropName || '').toLowerCase().includes(ql) ||
+        cropLabel(r).toLowerCase().includes(ql) ||
         fertilizerLabel(r.fertilizer).toLowerCase().includes(ql)
       )
     : null;
@@ -1777,7 +1976,7 @@ function renderFarmerSearch() {
               <div><div class="fname">${esc(latest.farmerName)}</div><div class="muted">এনআইডি: ${esc(nid)} | মোবাইল: ${esc(latest.mobile)}</div></div>
               <div><span class="badge badge-green">মোট গ্রহণ: ${list.length}</span></div>
             </div>
-            <div class="muted">ইউনিয়ন: ${esc(latest.union)} | গ্রাম: ${dashIfEmpty(latest.village)} | মৌজা: ${dashIfEmpty(latest.mouza)} | দাগ: ${dashIfEmpty(latest.dagNumber)} | খতিয়ান: ${dashIfEmpty(latest.khatianNumber)} | জমি: ${dashIfEmpty(latest.landArea)} শতাংশ | ফসল: ${dashIfEmpty(latest.cropName)}</div>
+            <div class="muted">ইউনিয়ন: ${esc(latest.union)} | গ্রাম: ${dashIfEmpty(latest.village)} | মৌজা: ${dashIfEmpty(latest.mouza)} | দাগ: ${dashIfEmpty(latest.dagNumber)} | খতিয়ান: ${dashIfEmpty(latest.khatianNumber)} | জমি: ${dashIfEmpty(latest.landArea)} শতাংশ | ফসল: ${dashIfEmpty(cropLabel(latest))}</div>
             <div class="muted">সর্বশেষ তারিখ: ${formatDate(latest.date)} | সর্বশেষ ডিলার: ${esc(latest.dealerName)}</div>
             <table class="mini-table"><thead><tr><th>সার</th><th>পরিমাণ</th><th>ডিলার</th><th>তারিখ</th></tr></thead><tbody>${list.map(r => `<tr><td>${esc(fertilizerLabel(r.fertilizer))}</td><td>${r.quantity} কেজি</td><td>${esc(r.dealerName)}</td><td>${formatDate(r.date)}</td></tr>`).join('')}</tbody></table>
           </div>`;
@@ -1926,6 +2125,16 @@ function toCSV(headers, rows) {
   rows.forEach(r => lines.push(r.map(escCsv).join(',')));
   return '\uFEFF' + lines.join('\n');
 }
+function csvDate(v) {
+  if (!v) return '';
+  const d = new Date(v);
+  if (isNaN(d)) return String(v);
+  return `${String(d.getDate()).padStart(2, '0')}/${String(d.getMonth() + 1).padStart(2, '0')}/${d.getFullYear()}`;
+}
+function csvPhone(v) {
+  const s = String(v === undefined || v === null ? '' : v);
+  return s ? `="${s.replaceAll('"', '""')}"` : '';
+}
 function downloadCSV(filename, csvContent) {
   const blob = new Blob([csvContent], { type: 'text/csv;charset=utf-8;' });
   const url = URL.createObjectURL(blob);
@@ -1946,8 +2155,8 @@ async function exportDistributionsCSV() {
     const all = await fetchAllDistributionsForExport(state.filters, (count) => {
       if (btn) btn.textContent = `এক্সপোর্ট হচ্ছে... (${count})`;
     });
-    const rows = all.map(r => [r.farmerName, csvTextGuard(r.nid), r.mobile, fertilizerLabel(r.fertilizer), r.quantity, r.dealerName, r.union, r.village || '-', r.landArea ?? '-', r.mouza || '-', r.dagNumber || '-', r.khatianNumber || '-', r.cropName || '-', r.date]);
-    downloadCSV('distributions.csv', toCSV(['কৃষক', 'এনআইডি', 'মোবাইল', 'সার', 'পরিমাণ(কেজি)', 'ডিলার', 'ইউনিয়ন', 'গ্রাম', 'জমি(শতাংশ)', 'মৌজা', 'দাগ নম্বর', 'খতিয়ান', 'ফসল', 'তারিখ'], rows));
+    const rows = all.map((r, i) => [i + 1, r.farmerName, csvTextGuard(r.nid), csvPhone(r.mobile), fertilizerLabel(r.fertilizer), r.quantity, r.dealerName, r.union, r.village || '-', r.landArea ?? '-', r.mouza || '-', r.dagNumber || '-', r.khatianNumber || '-', cropLabel(r) || '-', csvDate(r.date)]);
+    downloadCSV('distributions.csv', toCSV(['#', 'কৃষক', 'এনআইডি', 'মোবাইল', 'সার', 'পরিমাণ(কেজি)', 'ডিলার', 'ইউনিয়ন', 'গ্রাম', 'জমি(শতাংশ)', 'মৌজা', 'দাগ নম্বর', 'খতিয়ান', 'ফসল', 'তারিখ'], rows));
     showToast(`${all.length} টি রেকর্ড এক্সপোর্ট সম্পন্ন হয়েছে`, 'success');
   } catch (e) {
     showToast('এক্সপোর্ট ব্যর্থ হয়েছে: ' + ((e && e.message) || ''), 'error');
@@ -1956,12 +2165,12 @@ async function exportDistributionsCSV() {
   }
 }
 function exportDealersCSV() {
-  const rows = state.dealers.map(d => [d.name, d.mobile, d.email, d.union, d.area, d.status === 'inactive' ? 'নিষ্ক্রিয়' : 'সক্রিয়']);
-  downloadCSV('dealers.csv', toCSV(['নাম', 'মোবাইল', 'ইমেইল', 'ইউনিয়ন', 'এলাকা', 'স্ট্যাটাস'], rows));
+  const rows = state.dealers.map((d, i) => [i + 1, d.name, csvPhone(d.mobile), d.email, d.union, d.area, d.status === 'inactive' ? 'নিষ্ক্রিয়' : 'সক্রিয়']);
+  downloadCSV('dealers.csv', toCSV(['#', 'নাম', 'মোবাইল', 'ইমেইল', 'ইউনিয়ন', 'এলাকা', 'স্ট্যাটাস'], rows));
 }
 function exportDuplicatesCSV() {
-  const rows = state.duplicates.map(r => [r.farmerName, r.nid, fertilizerLabel(r.fertilizer), r.date, r.existingDate, r.dealerName, r.union]);
-  downloadCSV('duplicate_attempts.csv', toCSV(['কৃষক', 'এনআইডি', 'সার', 'চেষ্টার তারিখ', 'পূর্বের তারিখ', 'ডিলার', 'ইউনিয়ন'], rows));
+  const rows = state.duplicates.map((r, i) => [i + 1, r.farmerName, csvTextGuard(r.nid), fertilizerLabel(r.fertilizer), csvDate(r.date), csvDate(r.existingDate), r.dealerName, r.union]);
+  downloadCSV('duplicate_attempts.csv', toCSV(['#', 'কৃষক', 'এনআইডি', 'সার', 'চেষ্টার তারিখ', 'পূর্বের তারিখ', 'ডিলার', 'ইউনিয়ন'], rows));
 }
 function exportReportCSV() {
   const table = document.querySelector('#mainContent table.data-table');
@@ -2001,6 +2210,7 @@ document.getElementById('mainApp').addEventListener('click', async (e) => {
     case 'retry-load': await loadAllData(); break;
     case 'dist-next-page': await fetchDistPage('next'); break;
     case 'dist-prev-page': await fetchDistPage('prev'); break;
+    case 'dist-page': await goToDistPage(target.dataset.page); break;
     case 'dist-retry': await fetchDistPage('first'); break;
     case 'export-distributions': await exportDistributionsCSV(); break;
     case 'export-dealers': exportDealersCSV(); break;
@@ -2011,6 +2221,8 @@ document.getElementById('mainApp').addEventListener('click', async (e) => {
     case 'retry-load-logs': await loadSystemLogsOnly(); break;
     case 'add-fert-row': addFertRow(); break;
     case 'remove-fert-row': removeFertRow(target); break;
+    case 'add-crop-row': addCropRow(); break;
+    case 'remove-crop-row': removeCropRow(target); break;
     case 'search-farmer': {
       const input = document.getElementById('farmerSearchInput');
       performFarmerSearch(input ? input.value.trim() : '');
@@ -2040,12 +2252,13 @@ document.getElementById('mainApp').addEventListener('change', (e) => {
     handleFormFieldToggle(e.target.dataset.fieldToggle, e.target.checked);
     return;
   }
-  if (e.target.name === 'cropName' && e.target.form && e.target.form.id === 'distributionForm') {
-    const isCustom = e.target.value === CROP_CUSTOM_VALUE;
+  if (e.target.name === 'cropName[]' && e.target.form && e.target.form.id === 'distributionForm') {
+    const selected = [...e.target.form.querySelectorAll('select[name="cropName[]"]')].map(select => select.value);
+    const isCustom = selected.includes(CROP_CUSTOM_VALUE);
     const customField = document.getElementById('cropCustomField');
     const customInput = e.target.form.cropNameCustom;
     if (customField) customField.style.display = isCustom ? '' : 'none';
-    if (customInput) { customInput.required = isCustom; if (!isCustom) customInput.value = ''; }
+    if (customInput) { customInput.required = isCustom && isFieldRequired('cropName'); if (!isCustom) customInput.value = ''; }
   }
 });
 document.getElementById('modalRoot').addEventListener('click', (e) => {
